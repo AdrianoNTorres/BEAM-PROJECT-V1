@@ -42,6 +42,7 @@ REAR_UNSPRUNG_MASS = 40.0      # kg
 DISTANCE_FRONT_AXLE = 1.2      # meters (CoG to Front)
 DISTANCE_REAR_AXLE = 1.4       # meters (CoG to Rear)
 TIRE_STIFFNESS = 200000.0      # N/m
+TIRE_DAMPING = 2500.0          # Ns/m (Added tire damping constant)
 
 # --- DYNAMICALLY CALCULATED PHYSICS VALUES ---
 WHEELBASE = DISTANCE_FRONT_AXLE + DISTANCE_REAR_AXLE  # 2.6 meters
@@ -103,15 +104,17 @@ class HalfCarPitchSimulator:
         self.distance_front_axle = DISTANCE_FRONT_AXLE
         self.distance_rear_axle = DISTANCE_REAR_AXLE
 
-    def calculate_system_equations(self, time_t, state_vector, front_spring_rate, front_damping, rear_spring_rate, rear_damping, road_profile_func):
+    def calculate_system_equations(self, time_t, state_vector, front_spring_rate, front_damping, rear_spring_rate, rear_damping, road_profile_func, road_velocity_func):
         (vertical_bounce, vertical_velocity, 
          pitch_angle, pitch_velocity, 
          front_wheel_displacement, front_wheel_velocity, 
          rear_wheel_displacement, rear_wheel_velocity) = state_vector
         
-        # Sample road height profile with time lag for rear axle
+        # Sample road height profile and derivative (velocity) with time lag for rear axle
         road_height_front = road_profile_func(time_t)
-        road_height_rear = road_profile_func(time_t - REAR_AXLE_ROAD_LAG) 
+        road_height_rear = road_profile_func(time_t - REAR_AXLE_ROAD_LAG)
+        road_vel_front = road_velocity_func(time_t)
+        road_vel_rear = road_velocity_func(time_t - REAR_AXLE_ROAD_LAG)
         
         # Geometry coordinates for attachment points
         chassis_front_displacement = vertical_bounce - self.distance_front_axle * pitch_angle
@@ -123,9 +126,9 @@ class HalfCarPitchSimulator:
         front_suspension_force = -front_spring_rate * (chassis_front_displacement - front_wheel_displacement) - front_damping * (chassis_front_velocity - front_wheel_velocity)
         rear_suspension_force = -rear_spring_rate * (chassis_rear_displacement - rear_wheel_displacement) - rear_damping * (chassis_rear_velocity - rear_wheel_velocity)
         
-        # Compute tire contact forces (with lift-off protection)
-        front_tire_force = max(0.0, -TIRE_STIFFNESS * (front_wheel_displacement - road_height_front))
-        rear_tire_force = max(0.0, -TIRE_STIFFNESS * (rear_wheel_displacement - road_height_rear))
+        # Compute tire contact forces (lift-off protection mapped to stiffness and damping components)
+        front_tire_force = max(0.0, -TIRE_STIFFNESS * (front_wheel_displacement - road_height_front) - TIRE_DAMPING * (front_wheel_velocity - road_vel_front))
+        rear_tire_force = max(0.0, -TIRE_STIFFNESS * (rear_wheel_displacement - road_height_rear) - TIRE_DAMPING * (rear_wheel_velocity - road_vel_rear))
         
         # Accelerations via Newton's Second Law
         vertical_chassis_acceleration = (front_suspension_force + rear_suspension_force) / self.chassis_sprung_mass                  
@@ -146,13 +149,18 @@ class HalfCarPitchSimulator:
                 return BUMP_HEIGHT * np.sin(np.pi * (time_t - BUMP_START_TIME) / (BUMP_END_TIME - BUMP_START_TIME))
             return 0.0
 
+        def road_speed_bump_velocity(time_t):
+            if BUMP_START_TIME <= time_t <= BUMP_END_TIME:
+                return BUMP_HEIGHT * (np.pi / (BUMP_END_TIME - BUMP_START_TIME)) * np.cos(np.pi * (time_t - BUMP_START_TIME) / (BUMP_END_TIME - BUMP_START_TIME))
+            return 0.0
+
         initial_state = [0, 0, 0, 0, 0, 0, 0, 0]
         time_span = (SIM_TIME_START, SIM_TIME_END)
         time_evaluation_points = np.linspace(SIM_TIME_START, SIM_TIME_END, SIM_TIME_POINTS)
         
         simulation_solution = solve_ivp(
             lambda time_t, state_vector: self.calculate_system_equations(
-                time_t, state_vector, front_spring_rate, front_damping, rear_spring_rate, rear_damping, road_speed_bump
+                time_t, state_vector, front_spring_rate, front_damping, rear_spring_rate, rear_damping, road_speed_bump, road_speed_bump_velocity
             ),
             time_span, initial_state, t_eval=time_evaluation_points
         )
