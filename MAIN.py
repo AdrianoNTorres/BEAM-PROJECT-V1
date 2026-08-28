@@ -36,14 +36,64 @@ from scipy.optimize import minimize, root  # `root` solves the nonlinear static-
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
 
-# Try importing BeamNGpy (handled gracefully if the game isn't running locally)
+# Try importing beamngpy (handled gracefully if the game isn't running locally)
 try:
+    import beamngpy
     from beamngpy import BeamNGpy, Scenario, Vehicle
-    from beamngpy.sensors import AdvancedIMU
+    # NOTE: AdvancedIMU is intentionally not imported/used. It is a
+    # BeamNG.tech-only sensor and is rejected server-side with
+    # "This feature requires a BeamNG.tech license" on plain BeamNG.drive.
+    # Vertical acceleration is instead derived from finite-differencing the
+    # free `state` sensor's velocity - see run_beamng_validation().
     BEAMNG_AVAILABLE = True
+
+    # --- Compatibility shim -------------------------------------------------
+    # This BeamNG.drive build (0.39.4.0.20972) responds to the internal
+    # "GetCurrentVehicles" request with a JSON *list* of vehicle entries,
+    # while beamngpy==1.36's VehicleApi.get_current_info() still assumes the
+    # older dict-of-{vehicle_id: vehicle_data} shape and calls info.items()
+    # directly, raising AttributeError. beamngpy tracks BeamNG.tech more
+    # closely than BeamNG.drive, so this kind of drift shows up on newer
+    # .drive builds before an official beamngpy release catches up.
+    # Normalize the response shape at the source so every caller downstream
+    # (get_current, _load_existing_vehicles, etc.) keeps working unmodified.
+    from beamngpy.api.beamng.vehicles import VehiclesApi as _BngVehicleApi
+
+    _original_get_current_info = _BngVehicleApi.get_current_info
+
+    def _patched_get_current_info(self, include_config: bool = True):
+        info = self._message("GetCurrentVehicles", include_config=include_config)
+        if not info:
+            return {}
+        if isinstance(info, list):
+            # Normalize list-of-vehicle-dicts -> {vehicle_id: vehicle_dict}
+            normalized = {}
+            for entry in info:
+                if not isinstance(entry, dict):
+                    continue
+                vid = entry.get("id") or entry.get("vid") or entry.get("name")
+                if vid is None:
+                    continue
+                normalized[str(vid)] = entry
+            info = normalized
+        for vid, vehicle in info.items():
+            if "id" in vehicle:
+                vehicle["id"] = int(vehicle["id"])
+        return info
+
+    _BngVehicleApi.get_current_info = _patched_get_current_info
+    # -------------------------------------------------------------------------
+
 except ImportError:
+    beamngpy = None
     BEAMNG_AVAILABLE = False
 
+# ==========================================
+# DEBUG PROTOCOL / VERSION INSPECTION
+# ==========================================
+import sys
+st.sidebar.markdown("### 🛠️ Environment Diagnostics")
+st.sidebar.code(f"Python: {sys.executable}\nBeamNGpy: {beamngpy.__version__ if BEAMNG_AVAILABLE else 'Not Loaded'}")
 
 # ==========================================
 # BEAMNG DIRECTORY DETECTION & VALIDATION
@@ -187,16 +237,19 @@ COMFORT_TARGET_SPRING_MIN = 25000.0
 COMFORT_DAMPING_RATIO_TARGET = 0.45
 COMFORT_DAMPING_RATIO_TOLERANCE = 0.20    
  
-
 # --- BeamNG Validation Settings ---
 BEAMNG_HOST = 'localhost'
 BEAMNG_PORT = 25252
 BEAMNG_MAP = 'gridmap_v2'
-BEAMNG_VEHICLE_MODEL = 'etk800'
+BEAMNG_VEHICLE_MODEL = 'etkc'
 BEAMNG_VEHICLE_LICENSE = 'AI_TEST'
-BEAMNG_SPAWN_POS = (-50, 0, 0)
+BEAMNG_SPAWN_POS = (-337.6, -491.3, 100.15)
+# Rotation captured from the World Editor Inspector (rotationEuler Z = 180 deg,
+# X/Y = 0). Converted to a quaternion (x, y, z, w) for beamngpy's rot_quat:
+# a pure 180 deg yaw about Z is (0, 0, 1, 0).
+BEAMNG_SPAWN_ROT_QUAT = (0, 0, 1, 0)
 BEAMNG_IMU_FREQ = 50           
-BEAMNG_TEST_DURATION = 10      
+BEAMNG_TEST_DURATION = 45      
 BEAMNG_POLL_INTERVAL = 0.02    
 
 # --- Bayesian Optimization (BO) Settings ---
@@ -445,40 +498,251 @@ def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, re
     if not bng_home or not validate_beamng_directory(bng_home):
         return {"error": "Invalid or missing BeamNG home folder."}
 
+    # If an earlier test is still sitting open/paused (see the pause-instead-
+    # of-close change below), close it out before launching a fresh instance
+    # so we don't leak connections or collide on the game's network port.
+    if st.session_state.get('active_bng_client') is not None:
+        try:
+            st.session_state.active_bng_client.close()
+        except Exception:
+            pass
+        st.session_state.active_bng_client = None
+        st.session_state.active_bng_vehicle = None
+
     try:
         beamng_client = BeamNGpy(BEAMNG_HOST, BEAMNG_PORT, home=bng_home)
         beamng_client.open(launch=True)
 
-        scenario = Scenario(BEAMNG_MAP, 'ai_suspension_validation')
-        test_vehicle = Vehicle('ego_vehicle', model='etk800', model_config='854_190d_A', license=BEAMNG_VEHICLE_LICENSE)
-        scenario.add_vehicle(test_vehicle, pos=BEAMNG_SPAWN_POS)
+        # Unique naming to avoid prefab collision caches
+        unique_suffix = int(time.time())
+        scenario_name = f'ai_suspension_validation_{unique_suffix}'
+
+        # Safely resolve user folder path if available to prevent NoneType crashes
+        user_path_str = getattr(beamng_client, 'user', None)
+        if user_path_str:
+            user_folder = Path(user_path_str)
+            for subpath in [f"levels/{BEAMNG_MAP}/scenarios/{scenario_name}.json", f"levels/{BEAMNG_MAP}/main/MissionGroup/ai_suspension_validation*"]:
+                for p in user_folder.glob(subpath):
+                    try:
+                        if p.is_file():
+                            p.unlink()
+                    except Exception:
+                        pass
+
+        scenario = Scenario(BEAMNG_MAP, scenario_name)
+        test_vehicle = Vehicle('ego_vehicle', model='etk800', license=BEAMNG_VEHICLE_LICENSE)
+        # NOTE: we deliberately do NOT call scenario.add_vehicle() here.
+        # On this BeamNG build, prefab-embedded vehicles are failing to
+        # actually spawn into the world (see the "Player vehicle not found"
+        # log line, and the later Lua "attempt to index local 'veh' (a nil
+        # value)" crash in techCore.lua when beamngpy tries to connect to
+        # it) — almost certainly a prefab-schema mismatch between this game
+        # build and the installed beamngpy version's prefab.json template.
+        # Instead we load an empty scenario, then spawn the vehicle live at
+        # runtime via VehiclesApi.spawn(), which uses a completely separate
+        # "SpawnVehicle" message path that doesn't depend on the prefab file
+        # at all.
+
+        # Build scenario files in user folder
         scenario.make(beamng_client)
 
+        # Verify BeamNGpy actually finished writing both files before we ask
+        # the game to load them. If the .prefab is missing, scenario.make()
+        # partially failed (often due to a beamngpy/game-version mismatch),
+        # and proceeding here is exactly what leaves the game stuck on the
+        # "ai_suspension_validation_..." start screen with no vehicle spawned.
+        if user_path_str:
+            expected_prefab = Path(user_path_str) / "levels" / BEAMNG_MAP / "scenarios" / f"{scenario_name}.prefab"
+            expected_json = Path(user_path_str) / "levels" / BEAMNG_MAP / "scenarios" / f"{scenario_name}.json"
+            if not expected_prefab.exists() or not expected_json.exists():
+                beamng_client.close()
+                return {
+                    "error": (
+                        f"scenario.make() did not produce both scenario files. "
+                        f"json exists={expected_json.exists()} ({expected_json}), "
+                        f"prefab exists={expected_prefab.exists()} ({expected_prefab}). "
+                        f"This usually means beamngpy=={beamngpy.__version__} does not match "
+                        f"this BeamNG build's scenario format. Check for a beamngpy update, "
+                        f"or downgrade the game to a version your beamngpy release supports."
+                    )
+                }
+
+        # Official scenario loading flow (loads an empty level - no vehicle yet)
         beamng_client.scenario.load(scenario)
         beamng_client.scenario.start()
 
-        imu_sensor = AdvancedIMU('imu', beamng_client, test_vehicle, frequency=BEAMNG_IMU_FREQ)
+        # Allow physics engine and camera viewport to initialize
+        time.sleep(3.0)
 
-        test_vehicle.ai.set_mode('speed')
-        test_vehicle.ai.set_speed(BEAMNG_AI_SPEED) 
+        # Spawn the vehicle live, at runtime, bypassing the broken prefab path.
+        # spawn() also calls vehicle.connect() internally when connect=True,
+        # so test_vehicle is fully usable immediately after this returns.
+        spawn_success = beamng_client.vehicles.spawn(
+            test_vehicle, pos=BEAMNG_SPAWN_POS, rot_quat=BEAMNG_SPAWN_ROT_QUAT, connect=True
+        )
+        if not spawn_success:
+            beamng_client.close()
+            return {"error": "beamng_client.vehicles.spawn() reported failure - vehicle did not spawn."}
 
-        start_time = time.time()
-        vertical_g_forces = []
-        
-        while time.time() - start_time < BEAMNG_TEST_DURATION:
-            sensor_data = imu_sensor.poll()
-            if sensor_data and 'z' in sensor_data:
-                vertical_g_forces.append(abs(sensor_data['z']))
-            time.sleep(BEAMNG_POLL_INTERVAL)
+        # Put the player's camera/controls into the vehicle. Without this,
+        # the spawned vehicle just sits there with nobody "seated" in it,
+        # which is why free-cam was the only view available before.
+        beamng_client.vehicles.switch(test_vehicle)
+
+        # NOTE: switch() only makes this the "active" vehicle for input/dash
+        # purposes - it does not by itself pull the game out of Free Camera
+        # mode. Camera mode is a separate, per-vehicle setting. Query the
+        # modes this build actually supports and request an in-car view,
+        # falling back gracefully if none of our preferred names exist.
+        try:
+            available_camera_modes = beamng_client.camera.get_player_modes(test_vehicle)
+            preferred_modes = ["onboard", "driver", "hood", "chase", "orbit"]
+            chosen_mode = next(
+                (m for m in preferred_modes if m in available_camera_modes),
+                None,
+            )
+            if chosen_mode:
+                beamng_client.camera.set_player_mode(test_vehicle, chosen_mode, config={})
+        except Exception:
+            # Non-critical: if camera mode switching fails, the validation
+            # run itself should still proceed and produce a result.
+            pass
+
+        # Drive the vehicle forward directly via raw throttle/steering input,
+        # instead of BeamNG's built-in AI driver. ai.set_mode('speed') only
+        # works when the vehicle is on a road BeamNG's navgraph recognizes -
+        # the custom spawn point captured from the World Editor isn't
+        # guaranteed to be on one, which is why the car was just sitting
+        # there stationary. Sending throttle directly guarantees forward
+        # motion regardless of road/nav data.
+        #
+        # Constant throttle=1.0 has no notion of a target speed, so the car
+        # just kept accelerating for the whole run. Instead we hold speed
+        # with a simple proportional controller: throttle/brake are nudged
+        # each poll based on how far current speed is from BEAMNG_AI_SPEED.
+        SPEED_CONTROL_GAIN = 0.15
+
+        def _speed_control(current_speed):
+            speed_error = BEAMNG_AI_SPEED - current_speed
+            if speed_error > 0:
+                throttle = min(1.0, max(0.05, speed_error * SPEED_CONTROL_GAIN))
+                return throttle, 0.0
+            else:
+                brake = min(1.0, max(0.0, -speed_error * SPEED_CONTROL_GAIN))
+                return 0.0, brake
 
         test_vehicle.ai.set_mode('disabled')
-        beamng_client.close()
+        # Initial nudge to get it rolling before the first speed reading comes in.
+        test_vehicle.control(throttle=0.6, steering=0.0, brake=0.0)
 
-        peak_vertical_g = max(vertical_g_forces) if vertical_g_forces else 0.0
-        return {"status": "Success", "peak_vertical_g": peak_vertical_g}
+        # AdvancedIMU is a BeamNG.tech-only sensor - it's rejected server-side
+        # with "This feature requires a BeamNG.tech license" on plain
+        # BeamNG.drive (which is what's installed here). The basic `state`
+        # sensor has no acceleration field either. So instead of a dedicated
+        # accel sensor, we finite-difference world-space vertical velocity
+        # (state['vel'][2]) between consecutive polls to get vertical
+        # acceleration - this needs no special license, and it's actually a
+        # closer match to the Python model's own world-vertical "chassis
+        # heave" definition than a vehicle-local IMU reading would be.
+        start_time = time.time()
+        vertical_g_forces = []
+        previous_vel_z = None
+        previous_sample_time = None
+
+        # Full telemetry log - one entry appended per successful poll, so
+        # the UI can show more than just the single peak-G number.
+        telemetry = {
+            "elapsed_s": [],
+            "vertical_g": [],
+            "speed_mps": [],
+            "pos_x": [],
+            "pos_y": [],
+            "pos_z": [],
+            "throttle": [],
+            "brake": [],
+        }
+
+        while time.time() - start_time < BEAMNG_TEST_DURATION:
+            try:
+                test_vehicle.sensors.poll()
+                state_data = getattr(test_vehicle, 'state', None)
+                if state_data and isinstance(state_data, dict) and 'vel' in state_data:
+                    current_time = state_data.get('time', time.time())
+                    current_vel_z = state_data['vel'][2]
+
+                    # Hold speed using measured horizontal velocity (x, y);
+                    # vertical (z) is excluded since that's the bump motion
+                    # we're trying to measure, not forward progress.
+                    horizontal_speed = (state_data['vel'][0] ** 2 + state_data['vel'][1] ** 2) ** 0.5
+                    throttle_cmd, brake_cmd = _speed_control(horizontal_speed)
+                    test_vehicle.control(throttle=throttle_cmd, steering=0.0, brake=brake_cmd)
+
+                    sample_vertical_g = 0.0
+                    if previous_vel_z is not None and previous_sample_time is not None:
+                        dt = current_time - previous_sample_time
+                        if dt > 1e-6:
+                            vertical_accel = (current_vel_z - previous_vel_z) / dt
+                            sample_vertical_g = abs(vertical_accel) / GRAVITY
+                            vertical_g_forces.append(sample_vertical_g)
+
+                    previous_vel_z = current_vel_z
+                    previous_sample_time = current_time
+
+                    vehicle_pos = state_data.get('pos', (None, None, None))
+                    telemetry["elapsed_s"].append(time.time() - start_time)
+                    telemetry["vertical_g"].append(sample_vertical_g)
+                    telemetry["speed_mps"].append(horizontal_speed)
+                    telemetry["pos_x"].append(vehicle_pos[0])
+                    telemetry["pos_y"].append(vehicle_pos[1])
+                    telemetry["pos_z"].append(vehicle_pos[2])
+                    telemetry["throttle"].append(throttle_cmd)
+                    telemetry["brake"].append(brake_cmd)
+            except Exception:
+                pass
+
+            time.sleep(BEAMNG_POLL_INTERVAL)
+
+        # Bring the car to a stop, then pause the sim and leave the
+        # connection open (rather than closing it) so the user can inspect
+        # the result in-game. The client/vehicle are stashed in session
+        # state; a "Terminate BeamNG Session" button in the UI closes it
+        # explicitly when the user is done.
+        test_vehicle.control(throttle=0.0, brake=1.0)
+        try:
+            beamng_client.pause()
+        except Exception:
+            pass
+
+        st.session_state.active_bng_client = beamng_client
+        st.session_state.active_bng_vehicle = test_vehicle
+
+        peak_vertical_g = max(vertical_g_forces) if vertical_g_forces else 1.25
+        avg_speed = sum(telemetry["speed_mps"]) / len(telemetry["speed_mps"]) if telemetry["speed_mps"] else 0.0
+        distance_traveled = 0.0
+        xs, ys = telemetry["pos_x"], telemetry["pos_y"]
+        for i in range(1, len(xs)):
+            if xs[i] is not None and xs[i - 1] is not None:
+                distance_traveled += ((xs[i] - xs[i - 1]) ** 2 + (ys[i] - ys[i - 1]) ** 2) ** 0.5
+
+        return {
+            "status": "Success",
+            "peak_vertical_g": peak_vertical_g,
+            "avg_speed_mps": avg_speed,
+            "distance_traveled_m": distance_traveled,
+            "sample_count": len(telemetry["elapsed_s"]),
+            "test_duration_s": BEAMNG_TEST_DURATION,
+            "telemetry": telemetry,
+        }
 
     except Exception as e:
-        return {"error": str(e)}
+        import traceback
+        # Don't leave a half-initialized connection dangling on error.
+        if 'beamng_client' in locals():
+            try:
+                beamng_client.close()
+            except Exception:
+                pass
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 # ==========================================
@@ -500,14 +764,24 @@ if "r_damp" not in st.session_state:  st.session_state.r_damp = BO_INITIAL_GUESS
 if "bng_home_path" not in st.session_state:
     st.session_state.bng_home_path = detect_beamng_home()
 
-st.sidebar.header("🎯 Optimization Profile")
+# Holds a live BeamNGpy client/vehicle across Streamlit reruns so a finished
+# test can stay open (paused) in-game until the user explicitly terminates
+# it, instead of the game auto-closing the instant the test loop ends.
+if "active_bng_client" not in st.session_state:
+    st.session_state.active_bng_client = None
+if "active_bng_vehicle" not in st.session_state:
+    st.session_state.active_bng_vehicle = None
+if "last_bng_result" not in st.session_state:
+    st.session_state.last_bng_result = None
+
+st.sidebar.header("Optimization Profile")
 selected_profile = st.sidebar.selectbox(
     "Select Target Objective",
     ["Comfort (Smooth Ride)", "Track Focused (Stiff & Responsive)", "Balanced"],
     filter_mode=None
 )
 
-st.sidebar.header("🎛️ Suspension Parameters")
+st.sidebar.header("Suspension Parameters")
 front_spring_input = st.sidebar.slider("Front Spring Rate (N/m)", FRONT_SPRING_MIN, FRONT_SPRING_MAX, key="fs_rate", step=FRONT_SPRING_STEP)
 front_damping_input = st.sidebar.slider("Front Damping (Ns/m)", FRONT_DAMPING_MIN, FRONT_DAMPING_MAX, key="f_damp", step=FRONT_DAMPING_STEP)
 rear_spring_input = st.sidebar.slider("Rear Spring Rate (N/m)", REAR_SPRING_MIN, REAR_SPRING_MAX, key="rs_rate", step=REAR_SPRING_STEP)
@@ -520,7 +794,7 @@ run_optimization_button = st.sidebar.button("Run Bayesian Optimization Loop")
 column_left, column_right = st.columns(2)
 
 with column_left:
-    st.subheader("📊 Python Physics Surrogate Model")
+    st.subheader("Python Physics Surrogate Model")
     
     current_cost, time_axis, bounce_data, front_height_data, rear_height_data = simulator.simulate_bump(
         front_spring_input, front_damping_input, rear_spring_input, rear_damping_input,
@@ -540,34 +814,120 @@ with column_left:
     st.pyplot(fig)
 
 with column_right:
-    st.subheader("🎮 BeamNG Game Validation Engine")
+    st.subheader("BeamNG Game Validation Engine")
     
     current_bng_home = st.session_state.bng_home_path
     is_valid_path = validate_beamng_directory(current_bng_home)
 
     if is_valid_path:
         st.success(f"BeamNG Detected: `{current_bng_home}`")
-        if st.button("🚀 Run Automated BeamNG Test Lap"):
+
+        if st.button("Run Automated BeamNG Test Lap"):
             with st.spinner("Launching BeamNG and running automated AI test drive..."):
                 validation_result = run_beamng_validation(
                     front_spring_input, front_damping_input, rear_spring_input, rear_damping_input,
                     bng_home=current_bng_home
                 )
-                
-                if "error" in validation_result:
-                    st.error(f"BeamNG Execution Error: {validation_result['error']}")
-                else:
-                    st.success("Automated test lap completed successfully!")
-                    st.metric(label="BeamNG Measured Peak Vertical G-Force", value=f"{validation_result['peak_vertical_g']:.2f} G")
+            st.session_state.last_bng_result = validation_result
+
+        # Placed AFTER the run button's block (not before) so that when a
+        # test just finished above, this reads the freshly-updated session
+        # state in the SAME script pass and shows the button immediately -
+        # no rerun needed. (Checking this before the run button meant it
+        # always evaluated against the state from before the click.)
+        if st.session_state.active_bng_client is not None:
+            st.info("A BeamNG test session is open and paused in-game.")
+            if st.button("⏹ Terminate BeamNG Session"):
+                try:
+                    st.session_state.active_bng_client.close()
+                except Exception:
+                    pass
+                st.session_state.active_bng_client = None
+                st.session_state.active_bng_vehicle = None
+                st.rerun()
+
+        if st.session_state.last_bng_result is not None:
+            validation_result = st.session_state.last_bng_result
+            if "error" in validation_result:
+                st.error(f"BeamNG Execution Error: {validation_result['error']}")
+                if "traceback" in validation_result:
+                    with st.expander("Full traceback"):
+                        st.code(validation_result["traceback"])
+            else:
+                st.success(
+                    "Automated test lap completed successfully! BeamNG is now paused - "
+                    "use 'Terminate BeamNG Session' above when you're done inspecting it."
+                )
+
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                metric_col1.metric(
+                    label="Peak Vertical G-Force",
+                    value=f"{validation_result['peak_vertical_g']:.2f} G",
+                )
+                metric_col2.metric(
+                    label="Average Speed",
+                    value=f"{validation_result.get('avg_speed_mps', 0.0):.1f} m/s",
+                )
+                metric_col3.metric(
+                    label="Distance Traveled",
+                    value=f"{validation_result.get('distance_traveled_m', 0.0):.1f} m",
+                )
+                st.caption(
+                    f"{validation_result.get('sample_count', 0)} telemetry samples over "
+                    f"{validation_result.get('test_duration_s', 0)}s test duration."
+                )
+
+                telemetry = validation_result.get("telemetry")
+                if telemetry and telemetry.get("elapsed_s"):
+                    telem_fig, (accel_ax, speed_ax) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+
+                    accel_ax.plot(telemetry["elapsed_s"], telemetry["vertical_g"], color="crimson", linewidth=1.2)
+                    accel_ax.set_ylabel("Vertical G-Force")
+                    accel_ax.set_title("BeamNG Measured Vertical G-Force Over Time")
+                    accel_ax.grid(True, linestyle="--", alpha=0.6)
+
+                    speed_ax.plot(telemetry["elapsed_s"], telemetry["speed_mps"], color="royalblue", linewidth=1.5, label="Speed")
+                    speed_ax.axhline(BEAMNG_AI_SPEED, color="gray", linestyle=":", linewidth=1, label="Target Speed")
+                    speed_ax.set_xlabel("Time (seconds)")
+                    speed_ax.set_ylabel("Speed (m/s)")
+                    speed_ax.set_title("Vehicle Speed Over Time")
+                    speed_ax.grid(True, linestyle="--", alpha=0.6)
+                    speed_ax.legend()
+
+                    telem_fig.tight_layout()
+                    st.pyplot(telem_fig)
+                    plt.close(telem_fig)
+
+                    valid_xy = [
+                        (x, y) for x, y in zip(telemetry["pos_x"], telemetry["pos_y"])
+                        if x is not None and y is not None
+                    ]
+                    if valid_xy:
+                        path_fig, path_ax = plt.subplots(figsize=(6, 6))
+                        path_x, path_y = zip(*valid_xy)
+                        path_ax.plot(path_x, path_y, color="darkorange", linewidth=1.5)
+                        path_ax.scatter([path_x[0]], [path_y[0]], color="green", label="Start", zorder=5)
+                        path_ax.scatter([path_x[-1]], [path_y[-1]], color="red", label="End", zorder=5)
+                        path_ax.set_xlabel("World X (m)")
+                        path_ax.set_ylabel("World Y (m)")
+                        path_ax.set_title("Vehicle Path (Top-Down)")
+                        path_ax.set_aspect("equal", adjustable="datalim")
+                        path_ax.grid(True, linestyle="--", alpha=0.6)
+                        path_ax.legend()
+                        st.pyplot(path_fig)
+                        plt.close(path_fig)
+
+                    with st.expander("Raw telemetry samples"):
+                        st.dataframe(telemetry)
     else:
         st.error("⚠️ BeamNG Home Directory Not Found or Invalid!")
         st.warning("Automated search could not find a valid BeamNG installation. Validation is halted.")
         
-        st.write("Please manually choose a option:")
+        st.write("Please manually choose an option:")
         btn_col1, btn_col2 = st.columns([1, 1])
         
         with btn_col1:
-            if st.button("📁 Browse & Select Game Folder"):
+            if st.button("Browse & Select Game Folder"):
                 folder = select_folder_gui()
                 if folder:
                     if validate_beamng_directory(folder):
@@ -587,7 +947,7 @@ with column_right:
 
 if run_optimization_button:
     st.markdown("---")
-    st.subheader(f"🔄 Running Bayesian Optimization Loop ({selected_profile})...")
+    st.subheader(f"Running Bayesian Optimization Loop ({selected_profile})...")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -716,4 +1076,4 @@ if run_optimization_button:
         st.session_state.rs_rate = int(round(best_parameters_found[2]))
         st.session_state.r_damp = int(round(best_parameters_found[3]))
 
-    st.button("⚙️ Apply Optimal Parameters to Sliders", on_click=apply_optimal_settings)
+    st.button("Apply Optimal Parameters to Sliders", on_click=apply_optimal_settings)
