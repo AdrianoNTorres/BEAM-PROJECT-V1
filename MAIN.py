@@ -27,6 +27,7 @@ import csv
 import io
 import json
 import math
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,7 +46,7 @@ from sklearn.gaussian_process.kernels import Matern
 # Try importing beamngpy (handled gracefully if the game isn't running locally)
 try:
     import beamngpy
-    from beamngpy import BeamNGpy, Scenario, Vehicle
+    from beamngpy import BeamNGpy, Scenario, Vehicle, angle_to_quat
     from beamngpy.sensors import Electrics
     # NOTE: AdvancedIMU is intentionally not imported/used. It is a
     # BeamNG.tech-only sensor and is rejected server-side with
@@ -393,8 +394,87 @@ BEAMNG_SPAWN_POS = (-2956.696, 1257.925, 100.132)
 # about Z is (0, 0, sin(theta/2), cos(theta/2)).
 BEAMNG_SPAWN_ROT_QUAT = (0, 0, 1, 0)
 BEAMNG_IMU_FREQ = 50           
-BEAMNG_TEST_DURATION = 45      
+BEAMNG_TEST_DURATION = 180     
 BEAMNG_POLL_INTERVAL = 0.02    
+
+# Track files (see TRACK_CONE_AI_INTEGRATION.md §1) are authored in a small
+# LOCAL frame centered near their own (0, 0) for easy editing/portability
+# across levels - e.g. figure8_track.csv spans roughly -25..25 in x/y. That
+# is NOT the same frame as BEAMNG_SPAWN_POS, despite TrackPoint's docstring
+# assuming it already would be. Taken literally, every uploaded track was
+# being built right on top of gridmap_v2's own world origin, which is the
+# map's crowded central hub - which is why the track flow always looked
+# like it was "spawning in the default location" no matter what the
+# scenario/spawn code did. load_track_file() now translates every point by
+# this world-space anchor (x, y only - z is left alone, since track files
+# already give a real ground height like the sample's z=100) so a track
+# authored around its own (0,0) lands wherever this anchor points to
+# instead. Defaults to BEAMNG_SPAWN_POS's x/y since that's already been
+# confirmed as clear ground; override via the "Track World Origin" inputs
+# in the Track tab to place a track elsewhere on the map.
+TRACK_WORLD_ORIGIN_XY = (BEAMNG_SPAWN_POS[0], BEAMNG_SPAWN_POS[1])
+
+# The track flow used to spawn the car at the track's first point using the
+# same FIXED BEAMNG_SPAWN_ROT_QUAT as the bump-test flow, regardless of
+# which direction the track actually heads off in. Since that rotation was
+# only ever validated for the bump test's own straight-line heading, on
+# most tracks the car would spawn facing the wrong way relative to the
+# path - and BeamNG's AI script driver responds to that by backing/turning
+# in place to correct its heading before actually driving the path, which
+# is the "wants to drive in reverse to align itself" behavior. Two things
+# address this:
+#   1. The car is now spawned RUN_UP_DISTANCE_M behind the track's first
+#      point, facing along the initial tangent, with a matching run-up
+#      node prepended to the AI script - giving it room to roll up to
+#      speed and settle onto the path instead of starting from a dead
+#      stop exactly on top of node 0.
+#   2. The spawn rotation is now derived from the track's own initial
+#      heading instead of the fixed constant.
+# The heading->quat conversion below WAS empirically verified in-game: at
+# the +180 deg offset it still drove backward at the start of every track
+# run (confirmed by the user), so this is now flipped to +0.0 deg (i.e.
+# heading_to_spawn_quat() just uses the initial tangent's heading
+# directly, with no correction). If a future BeamNG/track-heading change
+# ever makes it drive backward again, +180.0 is the other value to try -
+# see BEAMNG_SPAWN_ROT_QUAT's comment above for why a load-bearing heading
+# constant like this needs to be re-verified in-game rather than assumed.
+#
+# RUN_UP_DISTANCE_M is the run-up gap ahead of the start/finish gate the
+# car is spawned at, facing straight along the track's initial tangent -
+# which is perpendicular to the gate itself (see compute_finish_line() /
+# compute_run_up_start()), so the car meets the line squared-up rather
+# than at an angle. Set to 5.0 m per the user's requested spawn gap.
+RUN_UP_DISTANCE_M = 5.0
+TRACK_HEADING_ROT_OFFSET_DEG = 0.0
+
+# --- Start/finish line + run-timeout settings (see compute_finish_line()
+# and run_beamng_track_test() below) ---
+# Hard safety-net timeout for a track run, independent of the AI script's
+# own scheduled duration. A run is meant to always end on its own via the
+# start/finish line crossing; this constant only matters if the car
+# crashes, gets stuck, or overcorrects badly enough that it never reaches
+# the finish - without it, a bad run just hangs the UI in "running"
+# indefinitely.
+ABSOLUTE_RUN_FALLBACK_S = 300.0
+# The "normal" (non-fallback) timeout is scaled off the AI script's own
+# scripted duration, but generously - a car that's fighting to stay on
+# line (overcorrecting) can take noticeably longer than the script's
+# idealized constant-speed timing assumed. run_beamng_track_test() takes
+# the larger of this and ABSOLUTE_RUN_FALLBACK_S, so short tracks still
+# get the full fallback window and long tracks get proportionally more.
+RUN_TIMEOUT_SCRIPT_MULTIPLIER = 2.5
+RUN_TIMEOUT_SCRIPT_PADDING_S = 30.0
+
+# vehicles.spawn() defaults cling=True, which snaps z to the actual ground
+# height at spawn time - but vehicles.teleport() (used right after, to force
+# the position - see load_beamng_scenario()) has no such option and places
+# the vehicle at the literal z given. A hardcoded/CSV-supplied z that's off
+# by even a few centimeters from the real terrain there means the teleport
+# embeds the wheels slightly instead of snapping clear, which can look like
+# the car being "stuck." This small upward margin is added only to
+# teleport()'s z (never spawn()'s, which doesn't need it) as cheap
+# insurance - the vehicle settles the rest of the way under gravity.
+TELEPORT_Z_CLEARANCE_M = 0.15
 
 # --- Track / Cone AI-Driving Settings ---
 # See TRACK_CONE_AI_INTEGRATION.md for the full design rationale. This is a
@@ -403,14 +483,13 @@ BEAMNG_POLL_INTERVAL = 0.02
 # free-license-only sensors) but drives a track loaded from a CSV/JSON file
 # instead of a single fixed bump.
 #
-# NOT VERIFIED IN-GAME: this is the exact placeholder flagged in
-# TRACK_CONE_AI_INTEGRATION.md section 0/9 - the real internal name of a
-# cone/pylon prop depends on the installed BeamNG version and must be
-# confirmed via the in-game vehicle/prop selector (props are listed after
-# vehicles there) before cone spawning will work. Leaving this as None makes
-# load_beamng_track_scenario() fail fast with a clear message instead of
-# silently spawning nothing or crashing deep inside scenario.make().
-BEAMNG_CONE_PROP_MODEL = "small"  # e.g. "party_cone" / "cone" - CONFIRM IN-GAME
+# Confirmed in-game by the user: the real part path for the small
+# orange/white traffic cone prop on this BeamNG install. This used to be
+# left as the placeholder "small", which is not a real shape path - that,
+# not the StaticObject/scenario logic below, was why cones never actually
+# appeared in-world (the add_object() calls "succeeded" against a garbage
+# shape and BeamNG silently rendered nothing for it).
+BEAMNG_CONE_PROP_MODEL = "vehicles/cones/small_orange_white_single.pc"
 DEFAULT_TRACK_WIDTH_M = 8.0
 DEFAULT_TRACK_SPEED_MPS = 14.0
 DEFAULT_CONE_SPACING_M = 5.0
@@ -423,6 +502,53 @@ TRACK_AI_SCRIPT_RESAMPLE_SPACING_M = 4.0  # centerline resampling interval for
                                            # TRACK_CONE_AI_INTEGRATION.md §4)
 TRACK_CONE_HIT_DAMAGE_DELTA_THRESHOLD = 0.01  # heuristic; see run_beamng_track_test()
 TRACK_CONE_HIT_DISTANCE_THRESHOLD_M = 2.5     # heuristic; see run_beamng_track_test()
+# The start/finish "line" (see compute_finish_line()) is really a finite
+# gate, not an infinite line - only a lateral offset (perpendicular to the
+# tangent) within this many meters of the start/finish point counts as
+# actually crossing the gate. Without this bound, a closed-loop track
+# whose own path runs parallel to the gate's direction anywhere on the map
+# (e.g. a rectangular track with an edge perpendicular to the start
+# straight) could be misread as crossing the gate far from the actual
+# start/finish. Generous relative to DEFAULT_TRACK_WIDTH_M to tolerate a
+# car overcorrecting off the racing line near the gate, but still bounded.
+FINISH_LINE_HALF_WIDTH_M = max(DEFAULT_TRACK_WIDTH_M, 15.0)
+
+# For a closed loop, the start line and finish line are the same physical
+# gate (see compute_finish_line()) - "cross it once to start the lap,
+# cross it again to finish." But the car can legitimately cross that same
+# gate more than twice near the very start of a run without ever having
+# driven the lap: the run-up alignment (see RUN_UP_DISTANCE_M/
+# TRACK_HEADING_ROT_OFFSET_DEG above) can wobble it back and forth over
+# the line, and each forward crossing looks identical to a real finish to
+# the plain sign-flip check. Requiring the car to have also passed a
+# handful of checkpoints spread around the rest of the track before a gate
+# crossing is accepted as the finish rules that out, since a checkpoint on
+# the far side of the track can't be reached by wobbling near the start.
+# See select_finish_checkpoints() / run_beamng_track_test().
+FINISH_CHECKPOINT_COUNT = 5
+# How close the car has to get to a checkpoint to count as having passed
+# it. Generous relative to cone spacing (checkpoints ARE cones - see
+# select_finish_checkpoints()) so normal cross-track wander near a
+# checkpoint still counts as passing it, but well inside
+# FINISH_CHECKPOINT_COUNT's arc-length spacing on any track long enough to
+# be worth gating in the first place.
+FINISH_CHECKPOINT_RADIUS_M = max(DEFAULT_TRACK_WIDTH_M, 8.0)
+
+# closest_point_on_polyline()'s distance_along result is used every poll to
+# drive cross-track error and (for open tracks) the shortfall/finish check,
+# so it needs to track the car's actual progress along the lap rather than
+# re-finding "the globally nearest point on the whole track" from scratch
+# each time. A figure-8 (or any track whose path crosses itself) can have
+# two arc-length values that sit at, or very near, the exact same physical
+# (x, y) - a fresh global search has no way to tell those apart and can
+# silently snap onto the wrong pass, especially while the car is mid
+# cross-track excursion near the crossing point. Once a real distance_along
+# is known, later polls only need to search near it. This window has to be
+# generous enough to cover a normal cross-track excursion plus however far
+# the car can travel in one poll interval, but small compared to the
+# arc-length gap between any two self-intersections on a real track (e.g.
+# ~52 m apart on the figure-8 sample), or it would defeat the point.
+TRACK_PROGRESS_SEARCH_WINDOW_M = 20.0
 
 # --- Bayesian Optimization (BO) Settings ---
 BO_NUM_INITIAL_SAMPLES = 8     
@@ -861,12 +987,17 @@ def parse_track_json(file_like):
     return json.loads(text)
 
 
-def load_track_file(uploaded_file, filename_hint=None):
+def load_track_file(uploaded_file, filename_hint=None, origin_xy=TRACK_WORLD_ORIGIN_XY):
     """Normalize a CSV or JSON upload into a validated TrackDefinition.
     Raises ValueError with a user-facing message on any validation failure -
     callers should catch this and show it via st.error rather than letting
     it surface as a raw traceback, since a malformed track file is an
     expected user-facing error case, not a bug.
+
+    origin_xy translates every point's (x, y) by this much after parsing,
+    converting a track authored in its own local frame (see
+    TRACK_WORLD_ORIGIN_XY above) into BeamNG world coordinates. z is left
+    untouched - track files already specify a real ground height there.
     """
     name_for_ext = (filename_hint or getattr(uploaded_file, "name", "") or "").lower()
     is_json = name_for_ext.endswith(".json")
@@ -902,7 +1033,10 @@ def load_track_file(uploaded_file, filename_hint=None):
         z = float(p["z"]) if p.get("z") not in (None, "") else None
         width_m = float(p["width_m"]) if p.get("width_m") not in (None, "") else None
         speed_mps = float(p["speed_mps"]) if p.get("speed_mps") not in (None, "") else None
-        points.append(TrackPoint(x=x, y=y, z=z, width_m=width_m, speed_mps=speed_mps))
+        points.append(TrackPoint(
+            x=x + origin_xy[0], y=y + origin_xy[1],
+            z=z, width_m=width_m, speed_mps=speed_mps,
+        ))
 
     deduped = _dedupe_near_points(points, MIN_TRACK_POINT_SPACING_M)
     if len(deduped) < 3:
@@ -1030,14 +1164,212 @@ def generate_cone_positions(track: TrackDefinition, cone_spacing_m=DEFAULT_CONE_
     return cones
 
 
+def compute_run_up_geometry(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M):
+    """Shared geometry for the run-up lane - the straight stretch the car
+    drives from its spawn point (see compute_run_up_start()) up to the
+    track's own first point. Used by both generate_run_up_cone_positions()
+    (to lay cones along this lane) and generate_all_cone_positions() (to
+    filter out any main-track cone that would fall inside it). Kept as a
+    separate function so both stay in agreement about where the lane
+    actually is instead of recomputing the tangent/width independently."""
+    p0, p1 = track.points[0], track.points[1]
+    dx, dy = p1.x - p0.x, p1.y - p0.y
+    dist = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / dist, dy / dist
+    z0 = p0.z if p0.z is not None else 0.0
+    run_up_start = (p0.x - ux * run_up_m, p0.y - uy * run_up_m, z0)
+    width = p0.width_m if p0.width_m is not None else track.default_width_m
+    return {
+        "run_up_start": run_up_start,
+        "track_start": (p0.x, p0.y, z0),
+        "tangent": (ux, uy),
+        "width_m": width,
+    }
+
+
+def generate_run_up_cone_positions(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M,
+                                    cone_spacing_m=DEFAULT_CONE_SPACING_M):
+    """Cones flanking the run-up lane itself. generate_cone_positions() only
+    ever walks the track's own points, so the run-up stretch the car
+    actually spawns on and drives through before reaching node 0 had no
+    cones of its own - this fills that gap, using the same left/right
+    normal-offset convention as compute_boundary_offsets() (so a run-up
+    cone and the first track-boundary cone line up on the same left/right
+    lines rather than kinking sideways at the handoff point) and the same
+    width as the track's own first point (so the lane doesn't visually
+    pinch or flare right where the run-up meets the track).
+
+    Stops short of the track's first point itself (that pair of cones is
+    already produced by generate_cone_positions()) so the two cone sets
+    don't overlap/duplicate right at the handoff.
+    """
+    geom = compute_run_up_geometry(track, run_up_m=run_up_m)
+    ux, uy = geom["tangent"]
+    nx, ny = -uy, ux  # left-hand normal, matching compute_boundary_offsets()
+    half = geom["width_m"] / 2.0
+    run_up_start = geom["run_up_start"]
+    n_steps = max(1, int(run_up_m // cone_spacing_m))
+    step = run_up_m / n_steps
+    cones = []
+    for i in range(n_steps):
+        t = i * step
+        cx = run_up_start[0] + ux * t
+        cy = run_up_start[1] + uy * t
+        cz = run_up_start[2] or 0.0
+        cones.append({"x": cx + nx * half, "y": cy + ny * half, "z": cz, "side": "left"})
+        cones.append({"x": cx - nx * half, "y": cy - ny * half, "z": cz, "side": "right"})
+    return cones
+
+
+def generate_all_cone_positions(track: TrackDefinition, cone_spacing_m=DEFAULT_CONE_SPACING_M,
+                                 run_up_m=RUN_UP_DISTANCE_M):
+    """The actual cone layout used for spawning/preview: the normal
+    track-boundary cones (generate_cone_positions()) plus a matching set
+    along the run-up lane (generate_run_up_cone_positions()), with any
+    track-boundary cone that geometrically falls inside the run-up lane
+    dropped first.
+
+    That last part matters on tracks where some other stretch of the path
+    (e.g. the return leg of a closed loop, or a tight figure-8 crossing
+    near its own start) happens to pass close to the run-up lane in world
+    space - generate_cone_positions() has no notion of the run-up lane at
+    all, so nothing before this stopped it from placing a boundary cone
+    directly in the car's path before it even reaches node 0. The check is
+    purely geometric (is this cone inside the run-up lane's rectangle?),
+    not "which track point produced it," so it catches that case
+    regardless of which part of the track a blocking cone came from.
+
+    A cone sitting almost exactly at the track's own first point is left
+    alone even though it's technically at the far end of the lane - that's
+    the legitimate start-gate cone pair, not something blocking the
+    approach to it.
+    """
+    track_cones = generate_cone_positions(track, cone_spacing_m=cone_spacing_m)
+    geom = compute_run_up_geometry(track, run_up_m=run_up_m)
+    start_x, start_y, _ = geom["run_up_start"]
+    ux, uy = geom["tangent"]
+    half = geom["width_m"] / 2.0
+    # Stay a bit short of the far end of the lane (run_up_m) so the
+    # legitimate start-gate cones - which sit right at that end - aren't
+    # mistaken for something blocking the approach to them.
+    along_limit = max(0.0, run_up_m - min(cone_spacing_m / 2.0, run_up_m))
+
+    def _blocks_run_up(cone):
+        dx, dy = cone["x"] - start_x, cone["y"] - start_y
+        along = dx * ux + dy * uy
+        lateral = -dx * uy + dy * ux
+        return -1e-6 <= along <= along_limit and abs(lateral) <= half
+
+    filtered_track_cones = [c for c in track_cones if not _blocks_run_up(c)]
+    run_up_cones = generate_run_up_cone_positions(track, run_up_m=run_up_m, cone_spacing_m=cone_spacing_m)
+    return filtered_track_cones + run_up_cones
+
+
+def heading_to_spawn_quat(dx, dy):
+    """Convert a direction vector into a spawn rot_quat using the same
+    forward/backward convention BEAMNG_SPAWN_ROT_QUAT above needed an
+    empirical correction for. See TRACK_HEADING_ROT_OFFSET_DEG - flip it
+    to 0.0 if this turns out backward in-game."""
+    heading_deg = math.degrees(math.atan2(dy, dx))
+    return angle_to_quat((0, 0, heading_deg + TRACK_HEADING_ROT_OFFSET_DEG))
+
+
+def compute_run_up_start(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M):
+    """Returns (run_up_pos, rot_quat) - a point run_up_m behind the track's
+    first point along its initial tangent, and the rot_quat facing along
+    that same tangent. Used so the car spawns with room to roll up to
+    speed and align onto the path, instead of starting from a dead stop
+    exactly on top of the first AI-script node facing an unrelated
+    direction."""
+    p0, p1 = track.points[0], track.points[1]
+    dx, dy = p1.x - p0.x, p1.y - p0.y
+    dist = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / dist, dy / dist
+    run_up_pos = (p0.x - ux * run_up_m, p0.y - uy * run_up_m, p0.z)
+    return run_up_pos, heading_to_spawn_quat(ux, uy)
+
+
+def _unit_tangent(a: "TrackPoint", b: "TrackPoint"):
+    """Unit vector from point a to point b in the x/y plane."""
+    dx, dy = b.x - a.x, b.y - a.y
+    dist = math.hypot(dx, dy) or 1.0
+    return dx / dist, dy / dist
+
+
+def compute_finish_line(track: TrackDefinition):
+    """Defines the start/finish line(s) used to auto-stop a track run (see
+    run_beamng_track_test() below) - this is what was missing before: the
+    old stopping condition was just a centerline distance-along-track
+    threshold, which only worked for open tracks and reads confusingly once
+    the car has overcorrected/wandered (exactly what was being seen).
+
+    The start line sits at the track's first point, perpendicular to the
+    initial tangent - the same tangent compute_run_up_start() spawns the
+    car along, so the car is guaranteed to cross it once early on just by
+    driving off the run-up.
+
+    Closed loops reuse that same line as the finish line: one full lap is
+    "cross it once to actually start, cross it a second time to finish."
+    Open tracks get a separate finish line at the *last* point, using the
+    tangent of the final segment, so completion doesn't depend on the
+    noisier distance-along-track heuristic at all.
+
+    Returns a dict: start_point/start_tangent, finish_point/finish_tangent
+    ((x, y) tuples / (ux, uy) unit tangents), and same_line (True for
+    closed loops, meaning the finish line above is literally the start
+    line reused).
+    """
+    p0, p1 = track.points[0], track.points[1]
+    start_point = (p0.x, p0.y)
+    start_tangent = _unit_tangent(p0, p1)
+    if track.closed_loop:
+        finish_point, finish_tangent, same_line = start_point, start_tangent, True
+    else:
+        p_last, p_prev = track.points[-1], track.points[-2]
+        finish_point = (p_last.x, p_last.y)
+        finish_tangent = _unit_tangent(p_prev, p_last)
+        same_line = False
+    return {
+        "start_point": start_point, "start_tangent": start_tangent,
+        "finish_point": finish_point, "finish_tangent": finish_tangent,
+        "same_line": same_line,
+    }
+
+
+def _signed_line_progress(pos_xy, line_point, line_tangent):
+    """Signed distance of pos_xy along line_tangent, measured from
+    line_point - negative "behind" the line, >=0 "at or past" it. A sign
+    flip between two consecutive samples (negative -> >=0) means the
+    infinite line perpendicular to line_tangent through line_point was
+    crossed moving forward. See _lateral_offset_from_line() for bounding
+    this to a finite gate."""
+    return (pos_xy[0] - line_point[0]) * line_tangent[0] + (pos_xy[1] - line_point[1]) * line_tangent[1]
+
+
+def _lateral_offset_from_line(pos_xy, line_point, line_tangent):
+    """Perpendicular distance of pos_xy from line_point, measured along the
+    normal of line_tangent. Used to bound a crossing to the finite gate
+    around the start/finish point (FINISH_LINE_HALF_WIDTH_M) rather than
+    the infinite line _signed_line_progress() checks the sign of."""
+    nx, ny = -line_tangent[1], line_tangent[0]
+    return (pos_xy[0] - line_point[0]) * nx + (pos_xy[1] - line_point[1]) * ny
+
+
 def build_ai_script(track: TrackDefinition, resample_spacing_m=TRACK_AI_SCRIPT_RESAMPLE_SPACING_M,
-                     min_dt=MIN_SCRIPT_DT):
+                     min_dt=MIN_SCRIPT_DT, run_up_m=0.0):
     """Build the timestamped waypoint list for vehicle.ai.execute_script()
     (see TRACK_CONE_AI_INTEGRATION.md §4). Resamples the centerline at
     resample_spacing_m first - deliberately coarser than, and independent
     of, cone spacing (a dense cone-spacing-resolution polyline is the wrong
     input here). Requires at least 3 output nodes, matching execute_script's
-    own hard minimum."""
+    own hard minimum.
+
+    run_up_m, if > 0, prepends one extra node run_up_m behind the first
+    point along the initial tangent (see compute_run_up_start()) so the
+    script's own timeline agrees with where the car is actually spawned -
+    without this the vehicle would spawn behind node 0 but the script
+    would still expect it to already be AT node 0 at t=0.
+    """
     resampled = resample_track_by_arc_length(track, resample_spacing_m)
     if track.closed_loop and resampled:
         resampled = resampled + [resampled[0]]
@@ -1049,6 +1381,12 @@ def build_ai_script(track: TrackDefinition, resample_spacing_m=TRACK_AI_SCRIPT_R
         )
     script = []
     t = 0.0
+    if run_up_m > 0:
+        run_up_pos, _ = compute_run_up_start(track, run_up_m=run_up_m)
+        speed = resampled[0].speed_mps or track.default_speed_mps or DEFAULT_TRACK_SPEED_MPS
+        dt = max(run_up_m / max(speed, 0.1), min_dt)
+        script.append({"x": run_up_pos[0], "y": run_up_pos[1], "z": run_up_pos[2] or 0.0, "t": t})
+        t += dt
     script.append({"x": resampled[0].x, "y": resampled[0].y, "z": resampled[0].z or 0.0, "t": t})
     for prev, cur in zip(resampled, resampled[1:]):
         dist = math.hypot(cur.x - prev.x, cur.y - prev.y)
@@ -1059,18 +1397,76 @@ def build_ai_script(track: TrackDefinition, resample_spacing_m=TRACK_AI_SCRIPT_R
     return script
 
 
-def closest_point_on_polyline(px, py, track: TrackDefinition):
+def _segment_indices_near(cumulative, total, closed_loop, prev_along, window_m):
+    """Returns the indices i of segments (pts[i] -> pts[i+1]) whose
+    arc-length span is within window_m of prev_along - the along-track
+    distance from the *previous* poll, not physical (x, y) distance. This
+    is what lets closest_point_on_polyline() distinguish two segments that
+    happen to sit at/near the same physical location (a self-intersecting
+    track, e.g. a figure-8) but are far apart in arc length: only the one
+    near where the car actually was last is considered.
+
+    For closed loops, distance wraps around the seam (total <-> 0), e.g.
+    prev_along near `total` should still consider segments near 0."""
+    n_segs = len(cumulative) - 1
+
+    def _arc_dist(d):
+        raw = abs(d - prev_along)
+        return min(raw, total - raw) if closed_loop else raw
+
+    return [
+        i for i in range(n_segs)
+        if min(_arc_dist(cumulative[i]), _arc_dist(cumulative[i + 1])) <= window_m
+    ]
+
+
+def closest_point_on_polyline(px, py, track: TrackDefinition, prev_along=None,
+                               search_window_m=None, precomputed=None):
     """Cross-track error helper (TRACK_CONE_AI_INTEGRATION.md §5): projects
-    (px, py) onto the nearest segment of the track centerline. Returns
-    (distance_along_track_m, signed_lateral_offset_m, total_track_length_m).
-    Signed offset is positive to the left of direction of travel, negative
-    to the right (consistent with the left-hand normal used in
-    compute_boundary_offsets() above)."""
-    pts, cumulative = _cumulative_arc_length(track.points, track.closed_loop)
+    (px, py) onto the track centerline. Returns (distance_along_track_m,
+    signed_lateral_offset_m, total_track_length_m). Signed offset is
+    positive to the left of direction of travel, negative to the right
+    (consistent with the left-hand normal used in
+    compute_boundary_offsets() above).
+
+    By default (prev_along=None) this searches every segment on the track
+    and returns the single globally closest one - fine for a one-off call,
+    but NOT what a per-poll telemetry loop should do on a track that
+    self-intersects (see TRACK_PROGRESS_SEARCH_WINDOW_M above): two
+    segments can sit at nearly the same (x, y) while being far apart in
+    arc length, and a fresh global search can't tell them apart.
+
+    Pass prev_along (the distance_along_track_m result from the previous
+    call) together with search_window_m to instead restrict the search to
+    segments within that many arc-length meters of prev_along, so progress
+    is tracked locally rather than re-discovered from scratch every poll.
+    Falls back to a global search if that window happens to contain no
+    segments (shouldn't normally happen, but a track edit or a very small
+    window shouldn't be able to produce a crash).
+
+    precomputed, if given, should be the (pts, cumulative) tuple already
+    returned by _cumulative_arc_length(track.points, track.closed_loop) -
+    callers that invoke this every poll tick (e.g.
+    run_beamng_track_test()'s telemetry loop) should compute that once
+    outside the loop and pass it in here, since the track itself never
+    changes mid-run."""
+    pts, cumulative = precomputed if precomputed is not None else \
+        _cumulative_arc_length(track.points, track.closed_loop)
+    total = cumulative[-1]
+
+    if prev_along is not None and search_window_m is not None:
+        search_indices = _segment_indices_near(
+            cumulative, total, track.closed_loop, prev_along, search_window_m
+        )
+        if not search_indices:
+            search_indices = range(len(pts) - 1)
+    else:
+        search_indices = range(len(pts) - 1)
+
     best_dist_sq = None
     best_along = 0.0
     best_lateral = 0.0
-    for i in range(len(pts) - 1):
+    for i in search_indices:
         a, b = pts[i], pts[i + 1]
         abx, aby = b.x - a.x, b.y - a.y
         seg_len_sq = abx * abx + aby * aby
@@ -1093,7 +1489,65 @@ def closest_point_on_polyline(px, py, track: TrackDefinition):
                 # compute_boundary_offsets()'s convention above.
                 nx, ny = -aby / seg_len, abx / seg_len
                 best_lateral = dx * nx + dy * ny
-    return best_along, best_lateral, cumulative[-1]
+    return best_along, best_lateral, total
+
+
+def select_finish_checkpoints(track: TrackDefinition, cone_positions, count=FINISH_CHECKPOINT_COUNT,
+                               rng=None):
+    """Pick `count` checkpoints spread evenly around the track's arc length,
+    each one an actual cone drawn from cone_positions (i.e. "randomly
+    selected evenly spaced cones from the file") rather than a synthetic
+    point - see FINISH_CHECKPOINT_COUNT above for why this exists: a
+    closed-loop track's finish gate is the same physical line as its start
+    gate, and the car can cross it more than once near the very start of a
+    run (run-up alignment wobble) without having driven any of the actual
+    lap. Requiring these to all be passed first before a gate crossing
+    counts as the finish rules that out, since they're spread around the
+    rest of the track and can't be reached that way.
+
+    Splits [0, total_track_length) into `count` equal arc-length bins and
+    picks one cone at random from whichever cones happen to fall in each
+    bin (falling back to the single closest cone to that bin's center if
+    none do) - "randomly selected" so the checkpoint isn't always the same
+    cone (or always on the same left/right side) on repeated runs of the
+    same track, while "evenly spaced" keeps them spread around the whole
+    lap instead of clustering wherever cone density happens to be higher.
+
+    Returns a list of {"x", "y", "along_m"} dicts. Empty if there are no
+    cones to pick from or the track has zero length."""
+    if not cone_positions or count <= 0:
+        return []
+    total_length = _cumulative_arc_length(track.points, track.closed_loop)[1][-1]
+    if total_length <= 0:
+        return []
+    rng = rng if rng is not None else random
+
+    # Tag each cone with its arc-length position along the centerline so
+    # cones (which live on the left/right boundary offsets, not the
+    # centerline itself - see generate_cone_positions()) can be grouped
+    # into arc-length bins.
+    tagged = [
+        (closest_point_on_polyline(cone["x"], cone["y"], track)[0], cone)
+        for cone in cone_positions
+    ]
+
+    bin_width = total_length / count
+    checkpoints = []
+    for i in range(count):
+        bin_lo, bin_hi = i * bin_width, (i + 1) * bin_width
+        candidates = [cone for along, cone in tagged if bin_lo <= along < bin_hi]
+        if not candidates:
+            # No cone happened to land in this bin (possible with sparse
+            # cone spacing relative to `count`) - fall back to whichever
+            # cone is arc-length-closest to the bin's center so every bin
+            # still contributes one checkpoint.
+            bin_center = (bin_lo + bin_hi) / 2.0
+            _, nearest_cone = min(tagged, key=lambda t: abs(t[0] - bin_center))
+            candidates = [nearest_cone]
+        chosen = rng.choice(candidates)
+        along, _, _ = closest_point_on_polyline(chosen["x"], chosen["y"], track)
+        checkpoints.append({"x": chosen["x"], "y": chosen["y"], "along_m": along})
+    return checkpoints
 
 
 # ==========================================
@@ -1224,6 +1678,57 @@ def load_beamng_scenario(bng_home=None):
         if not spawn_success:
             beamng_client.close()
             return {"error": "beamng_client.vehicles.spawn() reported failure - vehicle did not spawn."}
+
+        # WORKAROUND: on this BeamNG build, vehicles.spawn()'s pos argument
+        # has been observed to be silently ignored while the sim is paused
+        # (see the pause() call above) - the vehicle materializes at the
+        # level's own default/center spawnpoint on gridmap_v2 instead of
+        # BEAMNG_SPAWN_POS. teleport() goes over a separate message path
+        # than spawn(), so issuing it immediately afterward forces the
+        # position regardless of whether spawn's own pos was honored.
+        try:
+            beamng_client.vehicles.teleport(
+                test_vehicle,
+                pos=(BEAMNG_SPAWN_POS[0], BEAMNG_SPAWN_POS[1], BEAMNG_SPAWN_POS[2] + TELEPORT_Z_CLEARANCE_M),
+                rot_quat=BEAMNG_SPAWN_ROT_QUAT, reset=True,
+            )
+        except Exception as teleport_exc:
+            beamng_client.close()
+            return {"error": f"Post-spawn teleport to BEAMNG_SPAWN_POS failed: {teleport_exc}"}
+
+        # Verify where the vehicle actually ended up instead of trusting
+        # spawn_success/teleport's return value blindly - if this still
+        # doesn't match BEAMNG_SPAWN_POS, the mismatch will be visible in
+        # the returned dict instead of only showing up as "car's in a wall"
+        # after the fact.
+        actual_spawn_pos = None
+        try:
+            test_vehicle.sensors.poll()
+            state_data = getattr(test_vehicle, 'state', None)
+            if state_data and isinstance(state_data, dict) and 'pos' in state_data:
+                actual_spawn_pos = tuple(state_data['pos'])
+        except Exception as poll_exc:
+            st.warning(f"⚠️ Could not verify spawn position after teleport ({poll_exc}) - proceeding unverified.")
+        if actual_spawn_pos is None:
+            st.warning(
+                "⚠️ Spawn position could not be read back from the vehicle's "
+                "state sensor - the teleport may or may not have taken "
+                "effect; this run is proceeding without that check."
+            )
+        else:
+            drift = math.dist(actual_spawn_pos[:2], BEAMNG_SPAWN_POS[:2])
+            if drift > 5.0:
+                beamng_client.close()
+                return {
+                    "error": (
+                        f"Vehicle spawned at {actual_spawn_pos}, "
+                        f"{drift:.1f}m from the intended BEAMNG_SPAWN_POS "
+                        f"{BEAMNG_SPAWN_POS}. Spawn/teleport did not take "
+                        f"effect - check the BeamNG/beamngpy version match."
+                    )
+                }
+            else:
+                st.info(f"✅ Vehicle confirmed at {actual_spawn_pos} (target {BEAMNG_SPAWN_POS}, drift {drift:.2f}m).")
 
         # Put the player's camera/controls into the vehicle. Without this,
         # the spawned vehicle just sits there with nobody "seated" in it,
@@ -1483,6 +1988,41 @@ def run_beamng_test(beamng_client, test_vehicle):
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
+def resume_and_focus_camera(beamng_client, test_vehicle):
+    """Resume the sim (if paused) and switch the player camera onto
+    test_vehicle, returning a human-readable warning string on any failure
+    or None on success. Shared by every flow that needs the camera to
+    actually follow the car - previously each flow duplicated this logic
+    with its own bare `except Exception: pass`, which is why camera/resume
+    failures kept going unnoticed. Any caller should st.warning() a non-None
+    return value rather than swallow it again."""
+    warning = None
+    try:
+        beamng_client.resume()
+    except Exception as resume_exc:
+        return f"beamng_client.resume() failed: {resume_exc}"
+
+    try:
+        beamng_client.vehicles.switch(test_vehicle)
+        available_camera_modes = beamng_client.camera.get_player_modes(test_vehicle)
+        preferred_modes = ["onboard", "driver", "hood", "chase", "orbit"]
+        chosen_mode = next(
+            (m for m in preferred_modes if m in available_camera_modes),
+            None,
+        )
+        if chosen_mode:
+            beamng_client.camera.set_player_mode(test_vehicle, chosen_mode, config={})
+        else:
+            warning = (
+                f"No preferred camera mode found in available modes: "
+                f"{available_camera_modes!r}"
+            )
+    except Exception as cam_exc:
+        warning = f"Camera mode switch failed: {cam_exc}"
+
+    return warning
+
+
 def wait_for_native_start(beamng_client, test_vehicle, poll_interval=0.05,
                            throttle_threshold=0.08, speed_threshold_mps=0.3,
                            timeout_s=None, disconnect_failure_limit=40):
@@ -1510,22 +2050,19 @@ def wait_for_native_start(beamng_client, test_vehicle, poll_interval=0.05,
     responding for disconnect_failure_limit consecutive polls in a row -
     e.g. the game window was closed manually while we were waiting.
     """
-    try:
-        beamng_client.resume()
-        
-        # ---> FIX: Apply camera focus and mode right here after resuming, 
-        # so BeamNG processes the view switch while unpaused.
-        beamng_client.vehicles.switch(test_vehicle)
-        available_camera_modes = beamng_client.camera.get_player_modes(test_vehicle)
-        preferred_modes = ["onboard", "driver", "hood", "chase", "orbit"]
-        chosen_mode = next(
-            (m for m in preferred_modes if m in available_camera_modes),
-            None,
+    # NOTE: this used to be a single bare `except Exception: pass` around
+    # the whole resume+camera block, which is why the free-cam issue was
+    # invisible for so long. Now shared via resume_and_focus_camera() so
+    # every flow (including the track-run flow) surfaces failures the same
+    # way instead of each one swallowing them separately.
+    camera_warning = resume_and_focus_camera(beamng_client, test_vehicle)
+
+    if camera_warning:
+        st.warning(
+            f"⚠️ Camera may still be in free-cam: {camera_warning} "
+            "You can switch views manually in-game (default key is usually "
+            "F7/Numpad keys depending on your BeamNG bindings)."
         )
-        if chosen_mode:
-            beamng_client.camera.set_player_mode(test_vehicle, chosen_mode, config={})
-    except Exception:
-        pass
 
     status_placeholder = st.empty()
     waited = 0.0
@@ -1652,9 +2189,17 @@ def load_beamng_track_scenario(bng_home, track: TrackDefinition, cone_spacing_m=
         st.session_state.track_bng_client = None
         st.session_state.track_bng_vehicle = None
 
-    cone_positions = generate_cone_positions(track, cone_spacing_m=cone_spacing_m)
-    start_point = track.points[0]
-    start_pos = (start_point.x, start_point.y, start_point.z if start_point.z is not None else BEAMNG_SPAWN_POS[2])
+    cone_positions = generate_all_cone_positions(track, cone_spacing_m=cone_spacing_m, run_up_m=RUN_UP_DISTANCE_M)
+    # Spawn RUN_UP_DISTANCE_M behind the track's first point, facing along
+    # its initial tangent, instead of exactly on node 0 using the fixed
+    # BEAMNG_SPAWN_ROT_QUAT - see the comment on RUN_UP_DISTANCE_M above for
+    # why (this is what was causing the AI to back up/spin in place at the
+    # start of every track run).
+    run_up_pos, spawn_rot_quat = compute_run_up_start(track, run_up_m=RUN_UP_DISTANCE_M)
+    start_pos = (
+        run_up_pos[0], run_up_pos[1],
+        run_up_pos[2] if run_up_pos[2] is not None else BEAMNG_SPAWN_POS[2],
+    )
 
     try:
         beamng_client = BeamNGpy(BEAMNG_HOST, BEAMNG_PORT, home=bng_home)
@@ -1708,11 +2253,54 @@ def load_beamng_track_scenario(bng_home, track: TrackDefinition, cone_spacing_m=
         time.sleep(3.0)
 
         spawn_success = beamng_client.vehicles.spawn(
-            test_vehicle, pos=start_pos, rot_quat=BEAMNG_SPAWN_ROT_QUAT, connect=True
+            test_vehicle, pos=start_pos, rot_quat=spawn_rot_quat, connect=True
         )
         if not spawn_success:
             beamng_client.close()
             return {"error": "beamng_client.vehicles.spawn() reported failure - vehicle did not spawn."}
+
+        # Same spawn()-ignores-pos-while-paused workaround as
+        # load_beamng_scenario() - force the position with teleport() since
+        # it uses a different message path than spawn().
+        try:
+            beamng_client.vehicles.teleport(
+                test_vehicle, pos=start_pos, rot_quat=spawn_rot_quat, reset=True
+            )
+        except Exception as teleport_exc:
+            beamng_client.close()
+            return {"error": f"Post-spawn teleport to track start_pos failed: {teleport_exc}"}
+
+        # Same verification as load_beamng_scenario() - confirm where the
+        # vehicle actually ended up rather than trusting the teleport call's
+        # return value blindly.
+        actual_spawn_pos = None
+        poll_failed = False
+        try:
+            test_vehicle.sensors.poll()
+            state_data = getattr(test_vehicle, 'state', None)
+            if state_data and isinstance(state_data, dict) and 'pos' in state_data:
+                actual_spawn_pos = tuple(state_data['pos'])
+        except Exception as poll_exc:
+            poll_failed = True
+            st.warning(f"⚠️ Could not verify track spawn position after teleport ({poll_exc}) - proceeding unverified.")
+        if actual_spawn_pos is None and not poll_failed:
+            st.warning(
+                "⚠️ Track spawn position could not be read back from the "
+                "vehicle's state sensor - proceeding without that check."
+            )
+        elif actual_spawn_pos is not None:
+            drift = math.dist(actual_spawn_pos[:2], start_pos[:2])
+            if drift > 5.0:
+                beamng_client.close()
+                return {
+                    "error": (
+                        f"Vehicle spawned at {actual_spawn_pos}, {drift:.1f}m "
+                        f"from the intended track start_pos {start_pos}. "
+                        f"Spawn/teleport did not take effect."
+                    )
+                }
+            else:
+                st.info(f"✅ Vehicle confirmed at {actual_spawn_pos} (track start {start_pos}, drift {drift:.2f}m).")
 
         beamng_client.vehicles.switch(test_vehicle)
 
@@ -1788,19 +2376,78 @@ def run_beamng_track_test(beamng_client, test_vehicle, track: TrackDefinition, a
                            cone_positions, max_duration_s=None):
     """Drive the track with BeamNG's own AI via execute_script(), polling
     every free-license sensor available (see TRACK_CONE_AI_INTEGRATION.md
-    §5). Stops on lap completion (distance-along-track reaching the track
-    length), a timeout, or a lost connection - whichever comes first.
+    §5). Stops on, in order of precedence:
+      1. Crossing the start/finish line (see compute_finish_line()) - the
+         primary, intended stopping condition, for both open tracks and
+         closed loops (a closed loop needs a *second* crossing of the same
+         line; an open track's finish line is a separate line at the last
+         point) - AND, for that second/finish crossing specifically, having
+         already passed all of FINISH_CHECKPOINT_COUNT checkpoints spread
+         around the rest of the track (see select_finish_checkpoints()).
+         Without the checkpoint requirement, a closed loop's finish gate
+         being the same physical line as its start gate means the car can
+         "finish" by crossing that line twice near the very start of the
+         run - e.g. wobbling back and forth while the run-up settles it
+         onto the path - without having driven any of the actual lap. A
+         crossing that doesn't clear the checkpoint requirement is simply
+         not treated as a finish; the run keeps going and waits for a real
+         one.
+      2. A generous timeout (ABSOLUTE_RUN_FALLBACK_S /
+         RUN_TIMEOUT_SCRIPT_MULTIPLIER above) - a safety net for a crashed/
+         stuck car, or an AI that falls so far behind its script's own
+         schedule it never reaches the finish, so a bad run always ends
+         instead of hanging the UI indefinitely.
+      3. A lost connection to BeamNG.
+    The old distance-along-track completion check is kept as a secondary,
+    belt-and-suspenders condition for open tracks (in case the finish-line
+    geometry is ever degenerate, e.g. a track with a near-zero-length final
+    segment), but the finish line is what normally ends the run.
+    max_duration_s, if given, overrides the computed timeout entirely
+    (mainly for tests/manual overrides); leave it None in normal use.
     """
     try:
-        total_length = _cumulative_arc_length(track.points, track.closed_loop)[1][-1]
-        # A closed loop obviously never "reaches the end" of the centerline
-        # in the same sense an open track does - use the AI script's own
-        # total scripted duration (plus slack) as the stopping condition
-        # instead for a loop, and distance-along-track for an open track.
+        # Computed once here (the track doesn't change mid-run) and passed
+        # into every closest_point_on_polyline() call below via
+        # `precomputed=` instead of being rebuilt from scratch on every
+        # poll tick.
+        track_pts_cumulative = _cumulative_arc_length(track.points, track.closed_loop)
+        total_length = track_pts_cumulative[1][-1]
         script_duration = ai_script[-1]["t"] if ai_script else 0.0
         if max_duration_s is None:
-            max_duration_s = script_duration * 1.5 + 10.0
-  
+            max_duration_s = max(
+                script_duration * RUN_TIMEOUT_SCRIPT_MULTIPLIER + RUN_TIMEOUT_SCRIPT_PADDING_S,
+                ABSOLUTE_RUN_FALLBACK_S,
+            )
+
+        finish_line = compute_finish_line(track)
+        crossed_start_line = False
+        finish_reached = False
+        prev_signed_start = None
+        prev_signed_finish = None
+
+        # See FINISH_CHECKPOINT_COUNT / select_finish_checkpoints() above -
+        # a finish-line crossing only counts once every checkpoint here has
+        # been passed at least once during the run.
+        finish_checkpoints = select_finish_checkpoints(track, cone_positions)
+        checkpoints_passed = [False] * len(finish_checkpoints)
+        # Diagnostic record of finish-line crossings that were rejected for
+        # not having cleared the checkpoints yet - surfaced in the returned
+        # dict so a run that looks like it "took a while to actually stop"
+        # is explainable rather than mysterious.
+        rejected_finish_crossings = []
+
+
+        # Explicitly release any brake/throttle/steering input left over
+        # from the post-load "hold still" state (load_beamng_track_scenario
+        # sets brake=1.0 so the car doesn't roll before a run is started) -
+        # execute_script is expected to take over control anyway, but a
+        # held brake at the exact moment the script starts is one plausible
+        # contributor to the car fighting itself at the start line, so
+        # clear it defensively right before handing off to the AI.
+        try:
+            test_vehicle.control(throttle=0.0, steering=0.0, brake=0.0)
+        except Exception:
+            pass
 
         test_vehicle.ai.set_script(ai_script, cling=True)
 
@@ -1830,7 +2477,79 @@ def run_beamng_track_test(beamng_client, test_vehicle, track: TrackDefinition, a
                     vel = state_data.get('vel', (0.0, 0.0, 0.0))
                     speed = math.hypot(vel[0], vel[1])
 
-                    distance_along, cross_track, _total = closest_point_on_polyline(pos[0], pos[1], track)
+                    # prev_along=distance_along carries the *previous*
+                    # poll's progress in, so the search stays local to
+                    # where the car actually was last instead of a fresh
+                    # global nearest-segment search every tick - see
+                    # TRACK_PROGRESS_SEARCH_WINDOW_M / closest_point_on_polyline().
+                    distance_along, cross_track, _total = closest_point_on_polyline(
+                        pos[0], pos[1], track,
+                        prev_along=distance_along,
+                        search_window_m=TRACK_PROGRESS_SEARCH_WINDOW_M,
+                        precomputed=track_pts_cumulative,
+                    )
+
+                    # --- Checkpoint tracking (see FINISH_CHECKPOINT_COUNT /
+                    # select_finish_checkpoints() above) - update before the
+                    # crossing checks below so a checkpoint reached on this
+                    # exact poll already counts toward this poll's crossing
+                    # decision. ---
+                    for j, checkpoint in enumerate(finish_checkpoints):
+                        if not checkpoints_passed[j]:
+                            d = math.hypot(checkpoint["x"] - pos[0], checkpoint["y"] - pos[1])
+                            if d <= FINISH_CHECKPOINT_RADIUS_M:
+                                checkpoints_passed[j] = True
+                    all_checkpoints_passed = all(checkpoints_passed) if finish_checkpoints else True
+
+                    # --- Start/finish line crossing (primary stop condition) ---
+                    pos_xy = (pos[0], pos[1])
+                    s_start = _signed_line_progress(pos_xy, finish_line["start_point"], finish_line["start_tangent"])
+                    start_lateral_ok = abs(_lateral_offset_from_line(
+                        pos_xy, finish_line["start_point"], finish_line["start_tangent"]
+                    )) <= FINISH_LINE_HALF_WIDTH_M
+                    if prev_signed_start is not None and prev_signed_start < 0.0 <= s_start and start_lateral_ok:
+                        if finish_line["same_line"]:
+                            # Closed loop: first forward crossing is just
+                            # leaving the run-up and starting the lap;
+                            # the second is the finish - but only once the
+                            # checkpoints have actually been passed. A
+                            # crossing that hasn't cleared them yet is
+                            # rejected outright rather than treated as a
+                            # second "start": the lap already started at
+                            # the first crossing, and re-arming that state
+                            # here would let the count of required
+                            # crossings silently grow with each rejection.
+                            if not crossed_start_line:
+                                crossed_start_line = True
+                            elif all_checkpoints_passed:
+                                finish_reached = True
+                            else:
+                                rejected_finish_crossings.append({
+                                    "elapsed_s": time.time() - start_time,
+                                    "checkpoints_passed": sum(checkpoints_passed),
+                                    "checkpoints_required": len(finish_checkpoints),
+                                })
+                        else:
+                            crossed_start_line = True
+                    prev_signed_start = s_start
+
+                    if not finish_line["same_line"]:
+                        s_finish = _signed_line_progress(pos_xy, finish_line["finish_point"], finish_line["finish_tangent"])
+                        finish_lateral_ok = abs(_lateral_offset_from_line(
+                            pos_xy, finish_line["finish_point"], finish_line["finish_tangent"]
+                        )) <= FINISH_LINE_HALF_WIDTH_M
+                        if (crossed_start_line and finish_lateral_ok and prev_signed_finish is not None
+                                and prev_signed_finish < 0.0 <= s_finish):
+                            if all_checkpoints_passed:
+                                finish_reached = True
+                            else:
+                                rejected_finish_crossings.append({
+                                    "elapsed_s": time.time() - start_time,
+                                    "checkpoints_passed": sum(checkpoints_passed),
+                                    "checkpoints_required": len(finish_checkpoints),
+                                })
+                        prev_signed_finish = s_finish
+                    # --- end start/finish line check ---
 
                     gforces_data = getattr(test_vehicle, 'gforces', None) or {}
                     lat_g = gforces_data.get('gx', gforces_data.get('gx2', 0.0)) if isinstance(gforces_data, dict) else 0.0
@@ -1888,7 +2607,11 @@ def run_beamng_track_test(beamng_client, test_vehicle, track: TrackDefinition, a
                         live_chart_placeholder.pyplot(live_fig)
                         plt.close(live_fig)
 
+                    if finish_reached:
+                        break
+                    # Secondary/belt-and-suspenders check - see docstring.
                     if not track.closed_loop and distance_along >= total_length - 1.0:
+                        finish_reached = True
                         break
                 consecutive_failures = 0
             except Exception:
@@ -1906,6 +2629,8 @@ def run_beamng_track_test(beamng_client, test_vehicle, track: TrackDefinition, a
                 "error": "Lost connection to BeamNG during the track run.",
                 "connection_lost": True,
                 "partial_telemetry": telemetry,
+                "finish_checkpoints_passed": sum(checkpoints_passed),
+                "finish_checkpoints_required": len(finish_checkpoints),
             }
 
         try:
@@ -1928,6 +2653,13 @@ def run_beamng_track_test(beamng_client, test_vehicle, track: TrackDefinition, a
             "final_distance_along_track_m": distance_along,
             "script_shortfall_m": script_shortfall,
             "sample_count": len(telemetry["elapsed_s"]),
+            "finish_line_crossed": finish_reached,
+            "run_timeout_s": max_duration_s,
+            "stopped_reason": "finish_line" if finish_reached else "timeout",
+            "finish_checkpoints": finish_checkpoints,
+            "finish_checkpoints_passed": sum(checkpoints_passed),
+            "finish_checkpoints_required": len(finish_checkpoints),
+            "rejected_finish_crossings": rejected_finish_crossings,
         }
 
     except Exception as e:
@@ -2447,9 +3179,23 @@ with st.expander("🏁 Track / Cone AI Driving (Beta)", expanded=False):
     with track_settings_col:
         cone_spacing_input = st.number_input("Cone spacing (m)", min_value=0.5, value=DEFAULT_CONE_SPACING_M, step=0.5)
 
+    # Track files are authored in a small local frame (see
+    # TRACK_WORLD_ORIGIN_XY above) - these let the track be placed anywhere
+    # on the map instead of always landing on BEAMNG_SPAWN_POS. Re-parses
+    # below whenever these change, since the offset is baked into the
+    # points at parse time.
+    origin_col_x, origin_col_y = st.columns(2)
+    with origin_col_x:
+        track_origin_x = st.number_input("Track World Origin X", value=float(TRACK_WORLD_ORIGIN_XY[0]), format="%.3f")
+    with origin_col_y:
+        track_origin_y = st.number_input("Track World Origin Y", value=float(TRACK_WORLD_ORIGIN_XY[1]), format="%.3f")
+
     if track_file is not None:
         try:
-            parsed = load_track_file(track_file, filename_hint=track_file.name)
+            parsed = load_track_file(
+                track_file, filename_hint=track_file.name,
+                origin_xy=(track_origin_x, track_origin_y),
+            )
             st.session_state.parsed_track = parsed
             st.session_state.track_parse_error = None
         except Exception as parse_exc:
@@ -2462,8 +3208,10 @@ with st.expander("🏁 Track / Cone AI Driving (Beta)", expanded=False):
     parsed_track = st.session_state.parsed_track
     if parsed_track is not None:
         try:
-            preview_cones = generate_cone_positions(parsed_track, cone_spacing_m=cone_spacing_input)
-            preview_script = build_ai_script(parsed_track)
+            preview_cones = generate_all_cone_positions(
+                parsed_track, cone_spacing_m=cone_spacing_input, run_up_m=RUN_UP_DISTANCE_M
+            )
+            preview_script = build_ai_script(parsed_track, run_up_m=RUN_UP_DISTANCE_M)
         except Exception as preview_exc:
             preview_cones, preview_script = [], []
             st.error(f"Could not build cone layout / AI script for this track: {preview_exc}")
@@ -2483,6 +3231,22 @@ with st.expander("🏁 Track / Cone AI Driving (Beta)", expanded=False):
             side_x = [c["x"] for c in preview_cones if c["side"] == side]
             side_y = [c["y"] for c in preview_cones if c["side"] == side]
             preview_ax.scatter(side_x, side_y, s=14, color=color, label=f"Cones ({side})")
+        # Draw the start/finish gate(s) the AI run will auto-stop on (see
+        # compute_finish_line() / FINISH_LINE_HALF_WIDTH_M) so it's visible
+        # before running, not just discovered after the fact in the result.
+        try:
+            preview_finish_line = compute_finish_line(parsed_track)
+            gate_specs = [("start", preview_finish_line["start_point"], preview_finish_line["start_tangent"], "green")]
+            if not preview_finish_line["same_line"]:
+                gate_specs.append(("finish", preview_finish_line["finish_point"], preview_finish_line["finish_tangent"], "black"))
+            for label, gate_point, gate_tangent, gate_color in gate_specs:
+                nx, ny = -gate_tangent[1], gate_tangent[0]
+                gx = [gate_point[0] - nx * FINISH_LINE_HALF_WIDTH_M, gate_point[0] + nx * FINISH_LINE_HALF_WIDTH_M]
+                gy = [gate_point[1] - ny * FINISH_LINE_HALF_WIDTH_M, gate_point[1] + ny * FINISH_LINE_HALF_WIDTH_M]
+                preview_ax.plot(gx, gy, color=gate_color, linewidth=2.5, linestyle=":",
+                                 label=f"{label.capitalize()} gate" + (" (start+finish)" if preview_finish_line["same_line"] else ""))
+        except Exception:
+            pass  # preview-only visualization; never block the rest of the preview on it
         preview_ax.set_aspect("equal", adjustable="datalim")
         preview_ax.set_xlabel("X (m)")
         preview_ax.set_ylabel("Y (m)")
@@ -2513,11 +3277,18 @@ with st.expander("🏁 Track / Cone AI Driving (Beta)", expanded=False):
                         client = st.session_state.track_bng_client
                         vehicle = st.session_state.track_bng_vehicle
                         cone_positions = (st.session_state.track_scenario_result or {}).get("cone_positions", [])
-                        try:
-                            beamng_client_module_pause = client.resume
-                            beamng_client_module_pause()
-                        except Exception:
-                            pass
+                        # This used to be an obfuscated resume() call
+                        # wrapped in `except Exception: pass` with no
+                        # camera handling at all - which is exactly why
+                        # the track flow's camera never followed the car
+                        # even though the top ("Load Scenario") flow's did.
+                        camera_warning = resume_and_focus_camera(client, vehicle)
+                        if camera_warning:
+                            st.warning(
+                                f"⚠️ Camera may still be in free-cam: {camera_warning} "
+                                "You can switch views manually in-game (default key is "
+                                "usually F7/Numpad keys depending on your BeamNG bindings)."
+                            )
                         with st.spinner("Running AI-driven track lap..."):
                             run_result = run_beamng_track_test(client, vehicle, parsed_track, preview_script, cone_positions)
                         st.session_state.last_track_run_result = run_result
@@ -2560,12 +3331,33 @@ with st.expander("🏁 Track / Cone AI Driving (Beta)", expanded=False):
                         st.code(run_result["traceback"])
             else:
                 telemetry = run_result["telemetry"]
-                m1, m2, m3, m4 = st.columns(4)
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
                 m1.metric("Sample count", run_result.get("sample_count", 0))
                 m2.metric("Distance driven", f"{run_result.get('final_distance_along_track_m', 0.0):.1f} m")
                 shortfall = run_result.get("script_shortfall_m")
                 m3.metric("Script shortfall", f"{shortfall:.1f} m" if shortfall is not None else "N/A (closed loop)")
                 m4.metric("Inferred cone hits", len(run_result.get("cone_hits", [])))
+                m5.metric("Finish line", "✅ Crossed" if run_result.get("finish_line_crossed") else "⏱️ Timed out")
+                m6.metric(
+                    "Checkpoints",
+                    f"{run_result.get('finish_checkpoints_passed', 0)}/{run_result.get('finish_checkpoints_required', 0)}",
+                )
+                if not run_result.get("finish_line_crossed"):
+                    st.warning(
+                        f"The run ended via the {run_result.get('run_timeout_s', 0.0):.0f}s fallback "
+                        "timeout without crossing the finish line - the car likely crashed, got "
+                        "stuck, or fell too far behind the AI script's schedule to finish. Check "
+                        "the driven-path plot below for where it stopped making progress."
+                    )
+                if run_result.get("rejected_finish_crossings"):
+                    n_rejected = len(run_result["rejected_finish_crossings"])
+                    st.info(
+                        f"The car crossed the start/finish line {n_rejected} time(s) before it "
+                        "had passed all of the required checkpoints, so those crossings weren't "
+                        "counted as the finish (see FINISH_CHECKPOINT_COUNT in MAIN.py) - this is "
+                        "expected if the car wobbles over the line while the run-up settles it "
+                        "onto the path at the start of a run."
+                    )
                 if shortfall and shortfall > 1.0:
                     st.warning(
                         "The AI fell behind the script's schedule and skipped ahead "

@@ -4,6 +4,197 @@ This file is for whoever (human or agent) picks this project up next. It
 covers what the app does, what was just changed, why, and what's still
 open. Read this before touching `MAIN.py`.
 
+## Most recent work: real cone prop path, run-up cones, 4x-scaled figure-8 track
+
+**Symptoms reported by the user:** (1) the figure-8 track was too small,
+(2) cones did not spawn at all, (3) the run-up lane (see
+`RUN_UP_DISTANCE_M`/`compute_run_up_start()`) had no cones of its own.
+
+**Cone spawn fix:** `BEAMNG_CONE_PROP_MODEL` was left at the placeholder
+`"small"` from the original integration work - not a real shape path, so
+`StaticObject(shape=...)` calls "succeeded" against garbage and nothing
+rendered in-world. The user confirmed the real part path in-game:
+`vehicles/cones/small_orange_white_single.pc`. `BEAMNG_CONE_PROP_MODEL` is
+now set to that. **Still not independently re-verified against a live
+BeamNG instance from this side** (same "no beamngpy/no network here" caveat
+as the rest of this project) - confirm `cones_confirmed` reads a nonzero
+number on the next in-game run.
+
+**Run-up cones:** `generate_cone_positions()` only ever walked the track's
+own points, so the run-up stretch the car spawns on and drives through
+before reaching node 0 (see `compute_run_up_start()`) had no cones flanking
+it at all. New `compute_run_up_geometry()` (shared tangent/width lookup)
+and `generate_run_up_cone_positions()` lay cones along that lane using the
+same left-hand-normal convention as `compute_boundary_offsets()`, at the
+track's own first-point width, stopping just short of the track's first
+point so they don't duplicate the cone pair already produced there.
+
+**Run-up-blocking cones removed:** new `generate_all_cone_positions()` is
+now the actual function called for both spawning (`load_beamng_track_scenario`)
+and the preview plot - it calls `generate_cone_positions()` as before, then
+drops any of those track-boundary cones that geometrically fall inside the
+run-up lane's rectangle (this can happen on a closed loop or a tight
+figure-8 where some other stretch of track passes close to the run-up lane
+in world space, even though it's a different part of the path), then adds
+the new run-up cones. The check is purely geometric (inside the lane's
+rectangle or not), not "which track point produced this cone," and it
+stops just short of the track's own first point so the legitimate
+start-gate cone pair is never mistaken for something blocking the approach
+to it. `generate_cone_positions()` itself is unchanged and still used
+internally.
+
+**Figure-8 track scaled 4x:** `figure8_track.csv`'s x/y columns were
+multiplied by 4 (roughly -25..25 -> -100..100), per the user's request that
+the track was too small. `z`, `width_m`, and `speed_mps` were left alone -
+only the geometric footprint changed, not the track width or the
+per-segment speed targets.
+
+### How this was verified
+
+Same standalone-extraction technique as the rest of this project (no
+`beamngpy`/`streamlit` here): `compute_run_up_geometry()`,
+`generate_run_up_cone_positions()`, and `generate_all_cone_positions()`
+were extracted into a throwaway script and run against the actual
+(scaled) `figure8_track.csv`:
+
+- `generate_all_cone_positions()` on the real track correctly identified
+  and dropped exactly one main-track boundary cone that fell inside the
+  run-up lane.
+- Scanning every cone in the combined output, none sit within 1 m of the
+  run-up lane's centerline (i.e. none would physically block the car's
+  path from its spawn point to the track's first point).
+- `python3 -m py_compile MAIN.py` passes on the full file.
+
+**Not verified:** anything requiring a live BeamNG instance - in
+particular, whether `vehicles/cones/small_orange_white_single.pc` is
+accepted by `StaticObject`/`scenario.make()` as-is (some BeamNG
+versions want the model name without the `vehicles/.../` prefix or
+without the `.pc` extension - if cones still don't appear, that prefix/
+extension is the first thing to try stripping), and whether the run-up
+cone spacing/width looks right driving it in-game.
+
+## Earlier work: start/finish line auto-stop + a real run timeout for the track/cone AI mode
+
+**Symptom reported by the user:** on the track/cone AI-driving mode (see
+below), the first press of "Run AI Lap" after a track loads drives in
+reverse, slowly weaving left/right and overcorrecting instead of driving
+the track. Pressing "Run AI Lap" again then drives correctly, but the run
+ends early ("cut short") before finishing.
+
+**What was actually missing, found by reading `run_beamng_track_test()`:**
+the *only* stopping condition for a run was (a) an open track's
+distance-along-centerline reaching the track length, or (b) a timeout of
+`script_duration * 1.5 + 10.0` seconds. Two problems with that:
+
+- **Closed loops had no completion check at all** - `distance_along` from
+  `closest_point_on_polyline()` is bounded to `[0, total_length]` and never
+  accumulates across a lap, so a closed-loop run could only ever end via
+  the timeout, never on actually finishing the lap.
+- **The timeout was tight and tied to the script's idealized constant-speed
+  timing.** A car that's fighting to stay on line (which is exactly what
+  the user described - the "reverse, weaving, overcorrecting" first
+  attempt) takes longer in wall-clock time than the script assumed, so the
+  timeout could cut a run off before it actually reached the end - this is
+  almost certainly what "cut short" on the second attempt was: the AI
+  script's own `execute_script` scheduling falling behind (see the
+  existing `script_shortfall_m` metric, which already flags this same
+  class of problem for open tracks) combined with a timeout too tight to
+  give it room to recover.
+
+**What changed (all in `MAIN.py`):**
+
+- **New `compute_finish_line(track)`** (section `1.5`, near
+  `compute_run_up_start()`) - defines a start gate at the track's first
+  point (perpendicular to the same initial tangent the car is spawned
+  along) and, for open tracks, a separate finish gate at the last point
+  (perpendicular to the final segment's tangent). Closed loops reuse the
+  start gate as the finish gate: one full lap is "cross it once to leave
+  the run-up and start, cross it a second time to finish."
+- **New `_signed_line_progress()` / `_lateral_offset_from_line()`** - the
+  actual crossing test. A gate crossing is a sign flip (behind → at/past)
+  in the tangential projection **and** a lateral offset within
+  `FINISH_LINE_HALF_WIDTH_M` of the gate point, so a track edge that
+  happens to run parallel to the gate's direction elsewhere on the map
+  isn't misread as a crossing (verified explicitly - see below).
+- **`run_beamng_track_test()`** now tracks gate crossings every poll and
+  stops the run when the finish gate is crossed forward, ahead of the old
+  distance-based check (kept as a secondary/belt-and-suspenders condition
+  for open tracks only, in case the gate geometry is ever degenerate -
+  e.g. a track with a near-zero-length final segment).
+- **New `ABSOLUTE_RUN_FALLBACK_S = 300.0`** (near `RUN_UP_DISTANCE_M`) - a
+  hard safety-net timeout, independent of the script's own scheduled
+  duration, so a crashed/stuck car or a script that falls too far behind
+  to ever reach the finish still always ends the run. The "normal" timeout
+  is now `max(script_duration * RUN_TIMEOUT_SCRIPT_MULTIPLIER (2.5) +
+  RUN_TIMEOUT_SCRIPT_PADDING_S (30.0), ABSOLUTE_RUN_FALLBACK_S)` - more
+  generous than the old `1.5x + 10.0`, and never below 5 minutes even for
+  a short track.
+- **`run_beamng_track_test()`'s result dict** now includes
+  `finish_line_crossed` (bool) and `stopped_reason` (`"finish_line"` or
+  `"timeout"`), and the UI shows a fifth metric ("Finish line: ✅ Crossed"
+  / "⏱️ Timed out") plus a warning when a run ends via the fallback
+  timeout without crossing the finish, pointing at the driven-path plot.
+- **Track preview plot** now draws the start (and, for open tracks,
+  finish) gate as a dotted line spanning `FINISH_LINE_HALF_WIDTH_M` on
+  each side, so the gate the run will auto-stop on is visible before
+  running, not just discoverable after the fact.
+- **Small defensive fix, same root cause as the reported symptom:**
+  `load_beamng_track_scenario()` leaves the vehicle holding a full brake
+  (`brake=1.0`, set after spawn so it doesn't roll before a run starts).
+  `run_beamng_track_test()` now explicitly clears throttle/steering/brake
+  right before `ai.set_script()` hands control to the AI, in case a held
+  brake at the exact moment the script starts was contributing to the car
+  fighting itself at the start line.
+
+**What this does NOT fully explain or fix:** the *reverse-driving-and-
+weaving* behavior itself on a first attempt is a BeamNG AI/execute_script
+behavior (see the existing `RUN_UP_DISTANCE_M`/`TRACK_HEADING_ROT_OFFSET_DEG`
+comments - this project has hit this class of issue before with the fixed
+bump-test spawn rotation). The run-up node's timing in `build_ai_script()`
+assumes the car is already at cruising speed the instant it spawns, which
+isn't physically true - if reverse/weaving on the *first* run persists
+after this change, try increasing `RUN_UP_DISTANCE_M` (give more room to
+accelerate before reaching node 0) or the run-up node's `dt` calculation
+in `build_ai_script()` (give it more scripted time to get up to speed).
+Not changed here to keep this change scoped to the requested start/finish
+auto-stop + timeout, and because it needs in-game observation to tune
+correctly, not more guessing from outside the game (same caution as
+`TRACK_HEADING_ROT_OFFSET_DEG`'s own comment).
+
+### How this was verified
+
+No `pytest` suite exists yet (same as every other entry here) and this
+environment has no `beamngpy`/`streamlit`/network access, so - same
+standalone-extraction technique as the rest of this project -
+`compute_finish_line()`, `_signed_line_progress()`, and
+`_lateral_offset_from_line()` were extracted into a throwaway script and
+exercised against synthetic driven paths:
+
+- An open straight track driven start to well past the end → finish
+  detected right at the finish point, not before.
+- An open straight track that only wiggles near the start and never
+  reaches the end → correctly never reports finished.
+- A closed-loop square track driven one full lap (with a synthetic path
+  that actually crosses the gate transversally rather than running along
+  it) → finish detected on the *second* gate crossing.
+- The same closed loop cut off right after the *first* crossing → correctly
+  not finished (this is exactly the "leaves the run-up, hasn't lapped yet"
+  case that must not be mistaken for completion).
+- A track whose own edge runs parallel to the gate's direction, far from
+  the actual start point (well outside `FINISH_LINE_HALF_WIDTH_M`) → not
+  misread as a crossing (this test failed against the first version of the
+  logic before the lateral-offset bound was added, which is exactly the
+  degenerate case that bound exists for).
+
+`python3 -m py_compile MAIN.py` and `ast.parse` both pass on the full file.
+Did **not** verify: anything requiring a live BeamNG instance - in
+particular, whether the new gate/timeout actually resolves the "cut short"
+symptom in-game, and whether the brake-release fix has any effect on the
+first-run reverse/weaving behavior. Run a track both ways (open and
+closed-loop) in-game and confirm the "Finish line" metric reads "✅
+Crossed" for a normal completed lap before trusting this for real
+tuning-validation runs.
+
 ## What this project is
 
 A Streamlit app (`MAIN.py`, single file) that:
