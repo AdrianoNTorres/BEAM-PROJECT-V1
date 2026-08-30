@@ -40,11 +40,14 @@ from sklearn.gaussian_process.kernels import Matern
 try:
     import beamngpy
     from beamngpy import BeamNGpy, Scenario, Vehicle
+    from beamngpy.sensors import Electrics
     # NOTE: AdvancedIMU is intentionally not imported/used. It is a
     # BeamNG.tech-only sensor and is rejected server-side with
     # "This feature requires a BeamNG.tech license" on plain BeamNG.drive.
     # Vertical acceleration is instead derived from finite-differencing the
-    # free `state` sensor's velocity - see run_beamng_validation().
+    # free `state` sensor's velocity - see run_beamng_test(). Electrics
+    # IS free/non-tech and exposes wheel-speed data, so it's attached below
+    # to pull in real per-wheel telemetry where available.
     BEAMNG_AVAILABLE = True
 
     # --- Compatibility shim -------------------------------------------------
@@ -89,17 +92,29 @@ except ImportError:
     BEAMNG_AVAILABLE = False
 
 # ==========================================
-# DEBUG PROTOCOL / VERSION INSPECTION
+# ENVIRONMENT DIAGNOSTICS
 # ==========================================
+# Surfaces the active Python interpreter and beamngpy version in the sidebar
+# so mismatches between this environment and a given BeamNG.drive build are
+# easy to spot when troubleshooting the validation bridge (see the
+# compatibility shim above, and the version-mismatch checks in
+# load_beamng_scenario()).
 import sys
-st.sidebar.markdown("### 🛠️ Environment Diagnostics")
+st.sidebar.markdown("### Environment Diagnostics")
 st.sidebar.code(f"Python: {sys.executable}\nBeamNGpy: {beamngpy.__version__ if BEAMNG_AVAILABLE else 'Not Loaded'}")
 
 # ==========================================
 # BEAMNG DIRECTORY DETECTION & VALIDATION
 # ==========================================
 def validate_beamng_directory(path_str: str) -> bool:
-    """Check if the provided path is a valid BeamNG home directory containing game executables."""
+    """Check whether path_str points at a real BeamNG.drive installation.
+
+    A folder is accepted as a valid game directory only if it actually
+    contains one of the known launcher executables, since beamngpy needs a
+    working `home` path to spawn the game process later. Several file names
+    are checked because the executable's location and version suffix have
+    changed across BeamNG.drive releases.
+    """
     if not path_str:
         return False
     
@@ -107,7 +122,7 @@ def validate_beamng_directory(path_str: str) -> bool:
     if not path.exists() or not path.is_dir():
         return False
 
-    # Check for expected game binaries/executables
+    # Known locations of the game executable across BeamNG.drive releases.
     valid_executables = [
         path / "BeamNG.drive.x64.exe",
         path / "Bin64" / "BeamNG.drive.x64.exe",
@@ -117,7 +132,16 @@ def validate_beamng_directory(path_str: str) -> bool:
 
 
 def detect_beamng_home() -> str | None:
-    """Automatically search standard paths and environment variables for BeamNG.drive."""
+    """Try to locate a BeamNG.drive installation without asking the user.
+
+    Checked in order, returning the first match:
+      1. The BNG_HOME environment variable, if set and valid.
+      2. A short list of default Steam library locations, since Steam is
+         the most common distribution channel for the game.
+
+    Returns None if nothing is found, in which case the dashboard falls
+    back to the manual folder picker / text-input flow.
+    """
     # 1. Check environment variable
     if "BNG_HOME" in os.environ and validate_beamng_directory(os.environ["BNG_HOME"]):
         return os.environ["BNG_HOME"]
@@ -139,7 +163,12 @@ def detect_beamng_home() -> str | None:
 
 
 def select_folder_gui() -> str | None:
-    """Launch a native desktop folder picker dialog to select the folder manually."""
+    """Open a native OS folder-picker dialog for manually locating BeamNG.drive.
+
+    Used as a fallback when detect_beamng_home() can't find the installation
+    automatically. Returns the selected path, or None if the user cancels
+    or tkinter is unavailable in this environment (e.g. headless server).
+    """
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -159,11 +188,18 @@ def select_folder_gui() -> str | None:
 # ==========================================
 
 # --- Suspension Parameter Bounds & Step Sizes ---
+# These define the search space for both the manual sliders and the
+# Bayesian Optimization loop. MIN/MAX set the physically plausible range for
+# a passenger-car coil spring / damper; STEP sets the slider granularity.
 FRONT_SPRING_MIN, FRONT_SPRING_MAX, FRONT_SPRING_STEP = 10000, 250000, 1000
 FRONT_DAMPING_MIN, FRONT_DAMPING_MAX, FRONT_DAMPING_STEP = 100, 50000, 100
 REAR_SPRING_MIN, REAR_SPRING_MAX, REAR_SPRING_STEP = 10000, 250000, 1000
 REAR_DAMPING_MIN, REAR_DAMPING_MAX, REAR_DAMPING_STEP = 100, 50000, 100
 
+# The optimizer works on the same four parameters as the sliders, so the
+# bounds passed to scipy.optimize.minimize are just the MIN/MAX pairs above,
+# grouped in (front_spring, front_damping, rear_spring, rear_damping) order
+# to match the argument order of HalfCarPitchSimulator.simulate_bump().
 SEARCH_BOUNDS = [
     (FRONT_SPRING_MIN, FRONT_SPRING_MAX),
     (FRONT_DAMPING_MIN, FRONT_DAMPING_MAX),
@@ -172,36 +208,76 @@ SEARCH_BOUNDS = [
 ]
 
 # --- Vehicle Layout & Fundamental Physical Constants ---
-# BEAMNG ETK800 AS REFERENCE
-BEAMNG_AI_SPEED = 15.0         
-CHASSIS_SPRUNG_MASS = 1455.0   
-FRONT_UNSPRUNG_MASS = 40.0     
-REAR_UNSPRUNG_MASS = 40.0      
-DISTANCE_FRONT_AXLE = 1.3958    
-DISTANCE_REAR_AXLE = 1.4498    
-TIRE_STIFFNESS = 200000.0      
-TIRE_DAMPING = 2500.0          
-GRAVITY = 9.81                 
+# Reference vehicle: BeamNG's ETK800. These values feed the equations of
+# motion in HalfCarPitchSimulator and should be updated together if the
+# reference vehicle ever changes.
+BEAMNG_AI_SPEED = 15.0          # Forward speed the car holds while crossing the bump, m/s
+CHASSIS_SPRUNG_MASS = 1455.0    # Mass carried by the springs (body + occupants), kg
+FRONT_UNSPRUNG_MASS = 40.0      # Mass NOT carried by the springs at the front axle (wheel, tire, hub, brake), kg
+REAR_UNSPRUNG_MASS = 40.0       # Same, at the rear axle, kg
+DISTANCE_FRONT_AXLE = 1.3958    # Distance from the chassis center of gravity to the front axle, m
+DISTANCE_REAR_AXLE = 1.4498     # Distance from the chassis center of gravity to the rear axle, m
+TIRE_STIFFNESS = 200000.0       # Vertical spring rate of the tire carcass/air itself, N/m
+TIRE_DAMPING = 2500.0           # Vertical damping of the tire carcass, Ns/m
+GRAVITY = 9.81                  # Standard gravitational acceleration, m/s^2
 
+# Wheelbase is simply the sum of the two axle-to-CG distances, front + rear.
 WHEELBASE = DISTANCE_FRONT_AXLE + DISTANCE_REAR_AXLE
-REAR_AXLE_ROAD_LAG = WHEELBASE / BEAMNG_AI_SPEED 
-PITCH_INERTIA = CHASSIS_SPRUNG_MASS * (DISTANCE_FRONT_AXLE * DISTANCE_REAR_AXLE) 
+
+# The car covers the wheelbase at BEAMNG_AI_SPEED before the rear axle
+# reaches the same point on the road the front axle already crossed, so the
+# rear axle's road input is simply the front axle's road input delayed by
+# wheelbase / speed (distance = speed * time, solved for time). This lag is
+# applied to the rear road-height function in calculate_system_equations().
+REAR_AXLE_ROAD_LAG = WHEELBASE / BEAMNG_AI_SPEED
+
+# Pitch (rotational) inertia of the sprung mass about its center of gravity.
+# A rigid bar of mass m pivoting between two points at distances a and b
+# from its center of mass has inertia I = m * a * b (the standard half-car
+# lumped-mass approximation used in ride-dynamics literature, in place of a
+# full radius-of-gyration measurement). Front/rear axle distances stand in
+# for a and b here.
+PITCH_INERTIA = CHASSIS_SPRUNG_MASS * (DISTANCE_FRONT_AXLE * DISTANCE_REAR_AXLE)
 
 # --- Simulation Profile Settings ---
-SIM_TIME_START = 0.0     
-SIM_TIME_END = 5.0       
-SIM_TIME_POINTS = 150    
+# Time window over which the ODE is integrated and the number of points at
+# which the solver reports the state (used for both plotting and the
+# np.gradient() finite-difference derivatives taken in simulate_bump()).
+SIM_TIME_START = 0.0
+SIM_TIME_END = 5.0
+SIM_TIME_POINTS = 150
 
-BUMP_START_TIME = 1.0    
-BUMP_HEIGHT = 0.05       
-BUMP_LENGTH = 0.5        
+# Speed-bump geometry: a single half-sine bump of BUMP_HEIGHT amplitude and
+# BUMP_LENGTH along the direction of travel, encountered starting at
+# BUMP_START_TIME.
+BUMP_START_TIME = 1.0
+BUMP_HEIGHT = 0.05
+BUMP_LENGTH = 0.5
 
+# How long the front tire is in contact with the bump: the bump's length
+# divided by the car's speed (time = distance / speed).
 BUMP_DURATION = BUMP_LENGTH / BEAMNG_AI_SPEED
-BUMP_END_TIME = BUMP_START_TIME + BUMP_DURATION 
+BUMP_END_TIME = BUMP_START_TIME + BUMP_DURATION
 
+# Windows used by simulate_bump() to score the response:
+#   - BUMP_EVENT_END marks the end of the "impact" window used for the
+#     peak pitch acceleration score. It extends past BUMP_END_TIME by the
+#     rear-axle road lag (so the rear axle's impact is included too) plus a
+#     short settling margin to catch the initial rebound.
+#   - POST_BUMP_START marks where the "post-bump settling" window begins,
+#     used for the RMS/peak-to-peak comfort metrics that measure how
+#     quickly the chassis settles back down after the bump.
 BUMP_EVENT_END = BUMP_END_TIME + REAR_AXLE_ROAD_LAG + 0.15
 POST_BUMP_START = BUMP_END_TIME + REAR_AXLE_ROAD_LAG + 0.2
 
+# Cost-function weights per optimization profile. simulate_bump() computes a
+# handful of raw ride-quality metrics (peak pitch acceleration, post-bump
+# heave RMS, etc.) and combines them into a single scalar cost via a
+# weighted sum; these dictionaries hold that weighting. Larger weights make
+# the optimizer penalize that metric more heavily. A weight of 0.0 (or a
+# missing key, which compute_realism_penalties() treats as 0.0 through
+# weights.get(..., 0.0)) means that term is excluded from the profile's
+# cost entirely.
 PROFILE_WEIGHTS = {
     "Comfort (Smooth Ride)": {
         "peak_pitch_accel": 1.0,
@@ -233,10 +309,14 @@ PROFILE_WEIGHTS = {
     },
 }
 
-COMFORT_TARGET_SPRING_MIN = 25000.0       
-COMFORT_DAMPING_RATIO_TARGET = 0.45
-COMFORT_DAMPING_RATIO_TOLERANCE = 0.20    
- 
+# Realism guardrails applied on top of the raw ride-quality metrics (see
+# HalfCarPitchSimulator.compute_realism_penalties()), so the optimizer
+# cannot "cheat" the cost function with springs so soft the car would bottom
+# out, or damping so far from critical that the setup would be undrivable.
+COMFORT_TARGET_SPRING_MIN = 25000.0       # Springs softer than this start incurring the underspring penalty, N/m
+COMFORT_DAMPING_RATIO_TARGET = 0.45       # Desired damping ratio (damping / critical damping); ~0.3-0.7 is typical for road cars
+COMFORT_DAMPING_RATIO_TOLERANCE = 0.20    # Allowed deviation from the target before the damping-ratio penalty kicks in
+
 # --- BeamNG Validation Settings ---
 BEAMNG_HOST = 'localhost'
 BEAMNG_PORT = 25252
@@ -245,24 +325,42 @@ BEAMNG_VEHICLE_MODEL = 'etkc'
 BEAMNG_VEHICLE_LICENSE = 'AI_TEST'
 BEAMNG_SPAWN_POS = (-337.6, -491.3, 100.15)
 # Rotation captured from the World Editor Inspector (rotationEuler Z = 180 deg,
-# X/Y = 0). Converted to a quaternion (x, y, z, w) for beamngpy's rot_quat:
-# a pure 180 deg yaw about Z is (0, 0, 1, 0).
-BEAMNG_SPAWN_ROT_QUAT = (0, 0, 1, 0)
-BEAMNG_IMU_FREQ = 50           
-BEAMNG_TEST_DURATION = 45      
-BEAMNG_POLL_INTERVAL = 0.02    
+# X/Y = 0), originally converted straight to quaternion (x, y, z, w) as
+# (0, 0, 1, 0) - a pure 180 deg yaw about Z. In practice that made the car
+# spawn facing backward relative to the intended driving direction (the
+# throttle-forward test drive was reversing down the road), so the World
+# Editor's Z-rotation reading and beamngpy's rot_quat evidently don't agree
+# on which way is "forward" here. Flipping by another 180 deg cancels back
+# out to identity (no extra yaw), which is the fix below. If the car is
+# still facing the wrong way after this, re-check the heading in the World
+# Editor and adjust this quaternion again - a pure yaw of theta degrees
+# about Z is (0, 0, sin(theta/2), cos(theta/2)).
+BEAMNG_SPAWN_ROT_QUAT = (0, 0, 0, 1)
+BEAMNG_IMU_FREQ = 50            # Target sensor polling rate, Hz (see BEAMNG_POLL_INTERVAL below)
+BEAMNG_TEST_DURATION = 45       # Maximum length of a timed validation run, seconds
+BEAMNG_POLL_INTERVAL = 0.02     # Sleep between sensor polls in the control loop, seconds (1 / BEAMNG_IMU_FREQ)
 
 # --- Bayesian Optimization (BO) Settings ---
-BO_NUM_INITIAL_SAMPLES = 8     
-BO_TOTAL_ITERATIONS = 100      
-BO_MATERN_NU = 1.5             
-BO_RESTARTS = 5                
-BO_RANDOM_STATE = 42           
-BO_LCB_KAPPA = 1.96            
+# See the "2. Guided (Bayesian) search" loop further down for how these are
+# used together: BO_NUM_INITIAL_SAMPLES random points build an initial
+# training set, then BO_TOTAL_ITERATIONS further points are chosen by
+# fitting a Gaussian Process and optimizing an acquisition function.
+BO_NUM_INITIAL_SAMPLES = 8      # Random samples drawn before the guided search begins
+BO_TOTAL_ITERATIONS = 100       # Maximum number of GP-guided samples after the initial random batch
+BO_MATERN_NU = 1.5              # Smoothness parameter of the GP's Matern kernel (1.5 allows a moderately rough cost surface)
+BO_RESTARTS = 5                 # Number of random restarts used when fitting the GP's kernel hyperparameters
+BO_RANDOM_STATE = 42            # Seed for the GP regressor, kept fixed for reproducible optimizer behavior
+BO_LCB_KAPPA = 1.96             # Exploration weight in the Lower Confidence Bound acquisition function (see below)
 
-BO_EARLY_STOPPING_PATIENCE = 15       
-BO_EARLY_STOPPING_MIN_DELTA = 0.01    
+# Early stopping: if BO_EARLY_STOPPING_PATIENCE consecutive guided
+# iterations fail to improve the best score by at least
+# BO_EARLY_STOPPING_MIN_DELTA, the search loop exits before using its full
+# iteration budget.
+BO_EARLY_STOPPING_PATIENCE = 15
+BO_EARLY_STOPPING_MIN_DELTA = 0.01
 
+# Slider/optimizer starting point: the midpoint of each parameter's
+# min/max range, used before any optimization has run.
 BO_INITIAL_GUESS = [
     int((FRONT_SPRING_MIN + FRONT_SPRING_MAX) / 2),
     int((FRONT_DAMPING_MIN + FRONT_DAMPING_MAX) / 2),
@@ -275,6 +373,26 @@ BO_INITIAL_GUESS = [
 # 1. THE PHYSICS SIMULATOR (Half-Car Pitch Model)
 # ==========================================
 class HalfCarPitchSimulator:
+    """Half-car (2D, pitch-plane) ride simulator.
+
+    Models the vehicle as three rigid masses connected by spring-damper
+    elements:
+
+        - One sprung mass (the chassis), which can both heave (translate
+          vertically) and pitch (rotate about its lateral axis).
+        - Two unsprung masses (front and rear wheel/tire/hub assemblies),
+          each free to move vertically, connected to the chassis through a
+          suspension spring-damper unit and to the road through a tire
+          modeled as its own spring-damper.
+
+    This ignores roll (side-to-side motion) entirely, which is why it is a
+    "half-car" model rather than a full 3D vehicle model - see the README
+    for the tradeoffs this implies.
+
+    The class itself only stores vehicle layout constants; the actual
+    integration and scoring happen in simulate_bump().
+    """
+
     def __init__(self):
         self.chassis_sprung_mass = CHASSIS_SPRUNG_MASS
         self.front_unsprung_mass = FRONT_UNSPRUNG_MASS
@@ -284,6 +402,24 @@ class HalfCarPitchSimulator:
         self.distance_rear_axle = DISTANCE_REAR_AXLE
 
     def compute_damping_ratios(self, front_spring_rate, front_damping, rear_spring_rate, rear_damping):
+        """Return the (front, rear) damping ratio for a given spring/damper setup.
+
+        The damping ratio (zeta = c / c_critical) describes how a
+        spring-mass-damper system responds after a disturbance: zeta < 1 is
+        underdamped (oscillates before settling), zeta = 1 is critically
+        damped (fastest non-oscillating return to rest), and zeta > 1 is
+        overdamped (settles slowly without oscillating). Road cars are
+        typically tuned somewhat underdamped for comfort.
+
+        Critical damping for a single-degree-of-freedom system is
+        c_critical = 2 * sqrt(k * m), where k is the spring rate and m is
+        the mass that spring is supporting. Here that supported mass is not
+        simply half the chassis mass - because the center of gravity sits
+        closer to one axle than the other, static weight distribution gives
+        each axle a share of the sprung mass proportional to its distance
+        from the *opposite* axle (the classic lever-arm result: the axle
+        nearer the CG carries more weight).
+        """
         front_sprung_load = self.chassis_sprung_mass * self.distance_rear_axle / WHEELBASE
         rear_sprung_load = self.chassis_sprung_mass * self.distance_front_axle / WHEELBASE
         front_critical_damping = 2.0 * np.sqrt(front_spring_rate * front_sprung_load)
@@ -293,6 +429,30 @@ class HalfCarPitchSimulator:
         return front_damping_ratio, rear_damping_ratio
 
     def compute_realism_penalties(self, front_spring_rate, front_damping, rear_spring_rate, rear_damping, weights):
+        """Score how physically sensible a candidate setup is, independent of ride quality.
+
+        The raw ride-quality metrics in simulate_bump() alone would let the
+        optimizer wander into unrealistic territory - for example, springs
+        soft enough to bottom out the suspension on real roads, or damping
+        far enough from critical to feel wallowy or harsh in ways the
+        simplified model doesn't otherwise penalize. This method adds two
+        quadratic "soft constraint" penalties on top of that base score:
+
+          - underspring_penalty: grows with the square of how far a spring
+            rate falls below COMFORT_TARGET_SPRING_MIN. Squaring means small
+            shortfalls are barely penalized while larger ones are penalized
+            much more heavily, discouraging unrealistically soft springs
+            without hard-capping the search space.
+          - damping_ratio_penalty: grows with the square of how far each
+            axle's damping ratio (from compute_damping_ratios()) falls
+            outside a tolerance band around COMFORT_DAMPING_RATIO_TARGET.
+
+        Both penalties are zero within their acceptable range and only
+        activate once a value crosses the threshold (via max(0.0, ...)),
+        so they do not distort the cost landscape for otherwise-reasonable
+        setups. The weights dict controls how heavily each profile applies
+        these penalties - see PROFILE_WEIGHTS.
+        """
         underspring_penalty = (
             max(0.0, COMFORT_TARGET_SPRING_MIN - front_spring_rate) ** 2
             + max(0.0, COMFORT_TARGET_SPRING_MIN - rear_spring_rate) ** 2
@@ -312,23 +472,68 @@ class HalfCarPitchSimulator:
         )
 
     def compute_static_equilibrium(self, front_spring_rate, rear_spring_rate):
+        """Solve for the vehicle's resting ride height and pitch before the bump.
+
+        Under gravity alone, the chassis settles into a static equilibrium
+        where every spring's compression force exactly balances the weight
+        it carries, and the net torque about the pitch axis is zero. This
+        is the same computation a real car undergoes at rest in a driveway:
+        the springs compress until they hold the car up.
+
+        Starting the ODE integration in simulate_bump() from this resting
+        state - rather than from zero displacement - means the simulation
+        does not have to spend its first fraction of a second "settling"
+        under its own weight before the bump even arrives, which would
+        otherwise pollute the peak-acceleration measurement with an
+        artifact of the initial condition rather than the bump itself.
+
+        Solved numerically with scipy.optimize.root because the tire force
+        term is nonlinear (a tire can only push, never pull, on the road -
+        see the max(0.0, ...) clamp below), so there is no closed-form
+        solution in general.
+        """
         def equilibrium_equations(state):
             vertical_bounce, pitch_angle, front_wheel_displacement, rear_wheel_displacement = state
             
+            # Displacement of the chassis at each axle's location, derived
+            # from the chassis's own bounce (vertical_bounce) and pitch
+            # (pitch_angle) via small-angle rigid-body kinematics: a point a
+            # distance d from the pivot moves by d * pitch_angle in addition
+            # to the whole-body bounce. Front and rear carry opposite signs
+            # because pitch_angle rotates the two ends of the chassis in
+            # opposite vertical directions.
             chassis_front_displacement = vertical_bounce - self.distance_front_axle * pitch_angle
             chassis_rear_displacement = vertical_bounce + self.distance_rear_axle * pitch_angle
             
+            # Spring compression is the relative displacement between the
+            # wheel and the chassis mounting point above it.
             front_compression = front_wheel_displacement - chassis_front_displacement
             rear_compression = rear_wheel_displacement - chassis_rear_displacement
             
+            # Hooke's law: spring force = stiffness * compression.
             front_suspension_force = front_spring_rate * front_compression
             rear_suspension_force = rear_spring_rate * rear_compression
             
+            # Tire force from Hooke's law against the (flat, zero-height)
+            # resting road surface, clamped at zero because a tire can only
+            # push against the road, never pull (it isn't bolted down).
             front_tire_force = max(0.0, TIRE_STIFFNESS * (0.0 - front_wheel_displacement))
             rear_tire_force = max(0.0, TIRE_STIFFNESS * (0.0 - rear_wheel_displacement))
             
+            # Net pitching torque on the chassis: each suspension force acts
+            # at its axle's distance from the pitch axis, with front and
+            # rear contributing opposite-sign torque (front pushes the nose
+            # up, rear pushes the tail up).
             pitch_torque = (rear_suspension_force * self.distance_rear_axle - front_suspension_force * self.distance_front_axle)
             
+            # At equilibrium every net force/torque term is zero. root()
+            # searches for the state where all four residuals below vanish
+            # simultaneously - i.e. Newton's second law (F = m*a, rearranged
+            # to net_force/mass - a = 0) applied to each mass, with a = 0 at
+            # rest, plus GRAVITY subtracted since it's the force being
+            # balanced out. Net pitch torque is used directly rather than
+            # divided by inertia, since torque = 0 and inertia = 0 are
+            # equivalent conditions.
             return [
                 (front_suspension_force + rear_suspension_force) / self.chassis_sprung_mass - GRAVITY,
                 pitch_torque, 
@@ -336,49 +541,104 @@ class HalfCarPitchSimulator:
                 (rear_tire_force - rear_suspension_force) / self.rear_unsprung_mass - GRAVITY,
             ]
 
+        # Initial guess: level chassis, wheels displaced slightly downward
+        # (a small negative number, rather than zero, gives the root finder
+        # a starting point where the tires are already in compression -
+        # closer to the true resting state than zero displacement, and
+        # avoids the perfectly flat, ambiguous gradient of the tire's
+        # max(0.0, ...) clamp at exactly zero compression).
         solution = root(equilibrium_equations, [0.0, 0.0, -0.01, -0.01])
         return solution.x 
 
     def calculate_system_equations(self, time_t, state_vector, front_spring_rate, front_damping, rear_spring_rate, rear_damping, road_profile_func, road_velocity_func):
+        """Right-hand side of the half-car's equations of motion, for use with solve_ivp.
+
+        This is the dynamic (time-varying) counterpart to
+        compute_static_equilibrium(): instead of solving for a state where
+        nothing moves, it computes the instantaneous acceleration of every
+        mass in the system - via Newton's second law, a = F_net / m - given
+        the current state and the road height each wheel currently sees.
+        scipy.integrate.solve_ivp calls this once per solver step to
+        advance the simulation forward in time.
+
+        The system has eight state variables: chassis bounce and pitch
+        (each with a position and a velocity), and front/rear wheel
+        vertical displacement (each with a position and a velocity). This
+        function returns their time derivatives - i.e. each variable's own
+        velocity, plus each velocity's acceleration - which is exactly the
+        vector solve_ivp integrates.
+        """
         (vertical_bounce, vertical_velocity, 
          pitch_angle, pitch_velocity, 
          front_wheel_displacement, front_wheel_velocity, 
          rear_wheel_displacement, rear_wheel_velocity) = state_vector
         
+        # Road height (and its rate of change) directly under each wheel
+        # right now. The rear wheel samples the same road profile as the
+        # front, but delayed in time by REAR_AXLE_ROAD_LAG, modeling the
+        # rear axle crossing the same point on the road the front axle
+        # already passed over.
         road_height_front = road_profile_func(time_t)
         road_height_rear = road_profile_func(time_t - REAR_AXLE_ROAD_LAG)
         road_vel_front = road_velocity_func(time_t)
         road_vel_rear = road_velocity_func(time_t - REAR_AXLE_ROAD_LAG)
         
+        # Chassis position/velocity at each axle mount point, from the same
+        # bounce + pitch rigid-body kinematics used in
+        # compute_static_equilibrium() - now including velocity terms since
+        # the system is in motion.
         chassis_front_displacement = vertical_bounce - self.distance_front_axle * pitch_angle
         chassis_rear_displacement = vertical_bounce + self.distance_rear_axle * pitch_angle
         chassis_front_velocity = vertical_velocity - self.distance_front_axle * pitch_velocity
         chassis_rear_velocity = vertical_velocity + self.distance_rear_axle * pitch_velocity
         
+        # Suspension spring compression and its rate of change (needed for
+        # the damping force below), from the relative motion between each
+        # wheel and the chassis point above it.
         front_compression = front_wheel_displacement - chassis_front_displacement
         rear_compression = rear_wheel_displacement - chassis_rear_displacement
         
         front_comp_velocity = front_wheel_velocity - chassis_front_velocity
         rear_comp_velocity = rear_wheel_velocity - chassis_rear_velocity
         
+        # Suspension force = spring force (Hooke's law) + damper force
+        # (proportional to the rate of compression change).
         front_suspension_force = front_spring_rate * front_compression + front_damping * front_comp_velocity
         rear_suspension_force = rear_spring_rate * rear_compression + rear_damping * rear_comp_velocity
         
+        # Tire compression relative to the current road surface height
+        # (which is nonzero while crossing the bump), and its rate of
+        # change.
         front_tire_compression = road_height_front - front_wheel_displacement
         rear_tire_compression = road_height_rear - rear_wheel_displacement
         
         front_tire_comp_velocity = road_vel_front - front_wheel_velocity
         rear_tire_comp_velocity = road_vel_rear - rear_wheel_velocity
         
+        # Tire force, again a spring + damper model, clamped at zero since
+        # a tire can only push against the road, never pull.
         front_tire_force = max(0.0, TIRE_STIFFNESS * front_tire_compression + TIRE_DAMPING * front_tire_comp_velocity)
         rear_tire_force = max(0.0, TIRE_STIFFNESS * rear_tire_compression + TIRE_DAMPING * rear_tire_comp_velocity)
         
+        # Newton's second law (a = F_net / m) for chassis bounce, chassis
+        # pitch (torque / rotational inertia), and each wheel's vertical
+        # motion. GRAVITY is subtracted from the two mass accelerations
+        # because it's a constant downward force already balanced out at
+        # the static equilibrium computed in compute_static_equilibrium();
+        # since the state vector's bounce/wheel-displacement values are
+        # already measured from that equilibrium point, gravity has to be
+        # subtracted out again here for consistency with those absolute
+        # (non-relative-to-equilibrium) suspension/tire force terms.
         vertical_chassis_acceleration = (front_suspension_force + rear_suspension_force) / self.chassis_sprung_mass - GRAVITY
         pitch_chassis_acceleration = (rear_suspension_force * self.distance_rear_axle - front_suspension_force * self.distance_front_axle) / self.pitch_inertia 
         
         front_wheel_acceleration = (front_tire_force - front_suspension_force) / self.front_unsprung_mass - GRAVITY
         rear_wheel_acceleration = (rear_tire_force - rear_suspension_force) / self.rear_unsprung_mass - GRAVITY
         
+        # solve_ivp expects the derivative of the full state vector: each
+        # position's derivative is simply the corresponding velocity
+        # already in the state, and each velocity's derivative is the
+        # acceleration computed above.
         return [
             vertical_velocity, vertical_chassis_acceleration, 
             pitch_velocity, pitch_chassis_acceleration, 
@@ -387,12 +647,38 @@ class HalfCarPitchSimulator:
         ]
 
     def simulate_bump(self, front_spring_rate, front_damping, rear_spring_rate, rear_damping, profile="Comfort (Smooth Ride)"):
+        """Run the full bump-crossing simulation and score the resulting ride.
+
+        Given one candidate suspension setup, this:
+          1. Finds the resting (pre-bump) state via compute_static_equilibrium().
+          2. Integrates the equations of motion in
+             calculate_system_equations() forward through the bump
+             encounter using solve_ivp.
+          3. Extracts several ride-quality metrics from the resulting
+             motion and combines them into a single scalar cost, weighted
+             according to the chosen optimization profile.
+
+        Returns (cost_score, time_points, chassis_heave, front_wheel_height,
+        rear_wheel_height) - the cost drives the optimizer, while the time
+        series are used for plotting.
+        """
         def road_speed_bump(time_t):
+            # Road height under a wheel at time_t: a single half-sine pulse
+            # of height BUMP_HEIGHT spanning BUMP_START_TIME to
+            # BUMP_END_TIME (a half-sine rises smoothly from zero, peaks at
+            # BUMP_HEIGHT, and returns smoothly to zero - a reasonable
+            # stand-in for a rounded speed bump profile). Flat road (height
+            # 0) everywhere else.
             if BUMP_START_TIME <= time_t <= BUMP_END_TIME:
                 return BUMP_HEIGHT * np.sin(np.pi * (time_t - BUMP_START_TIME) / (BUMP_END_TIME - BUMP_START_TIME))
             return 0.0
 
         def road_speed_bump_velocity(time_t):
+            # Analytic time-derivative of road_speed_bump(), i.e. d/dt of a
+            # sine is a scaled cosine. Needed for the tire damping term in
+            # calculate_system_equations(), which depends on how fast the
+            # road surface itself is moving under the wheel, not just its
+            # current height.
             if BUMP_START_TIME <= time_t <= BUMP_END_TIME:
                 return BUMP_HEIGHT * (np.pi / (BUMP_END_TIME - BUMP_START_TIME)) * np.cos(np.pi * (time_t - BUMP_START_TIME) / (BUMP_END_TIME - BUMP_START_TIME))
             return 0.0
@@ -491,7 +777,14 @@ def plot_optimization_history(history):
 # ==========================================
 # 2. BEAMNG AUTOMATION BRIDGE
 # ==========================================
-def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, rear_damping, bng_home=None):
+def load_beamng_scenario(bng_home=None):
+    """Launch BeamNG, build/load the scenario, and spawn the test vehicle -
+    but stop short of driving or starting the timer. This is the "scenario
+    start menu" step: it lets the level finish loading (and lets the user
+    visually confirm the car spawned correctly) before the timed test run
+    begins, so level/game load time no longer bleeds into the average-speed
+    and telemetry numbers. See run_beamng_test() for the actual timed run,
+    which is kicked off separately once the user presses Start."""
     if not BEAMNG_AVAILABLE:
         return {"error": "beamngpy library not installed or configured."}
     
@@ -571,12 +864,36 @@ def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, re
         beamng_client.scenario.load(scenario)
         beamng_client.scenario.start()
 
+        # Freeze the sim right here. scenario.start() is what puts up
+        # BeamNG's own "Start" screen (paused, free camera, orange Start
+        # button) - pausing now means the game actually sits frozen on that
+        # screen instead of quietly continuing to load/spawn/move things
+        # underneath it while it's shown. Everything below (spawning the
+        # vehicle, attaching sensors, setting the camera) happens while
+        # still paused; we only resume once the player is genuinely meant
+        # to take over - see wait_for_native_start(), which lifts this
+        # pause right before it starts polling for the accelerator press.
+        try:
+            beamng_client.pause()
+        except Exception:
+            pass
+
         # Allow physics engine and camera viewport to initialize
         time.sleep(3.0)
 
         # Spawn the vehicle live, at runtime, bypassing the broken prefab path.
         # spawn() also calls vehicle.connect() internally when connect=True,
         # so test_vehicle is fully usable immediately after this returns.
+        # (Spawning is a scene-graph operation, not a physics step, so this
+        # works fine while the sim is paused.)
+        #
+        # NOTE: because there's no vehicle in the prefab, BeamNG's own
+        # scenario system logs a "Player vehicle not found" warning and its
+        # native "Start" button on the paused screen won't do anything
+        # useful if clicked (it's looking for a prefab vehicle that was
+        # never there by design - see the note above run_beamng_test()).
+        # That's expected and harmless here: don't click it. Once the car
+        # is visible in the world below, just press the accelerator.
         spawn_success = beamng_client.vehicles.spawn(
             test_vehicle, pos=BEAMNG_SPAWN_POS, rot_quat=BEAMNG_SPAWN_ROT_QUAT, connect=True
         )
@@ -588,6 +905,14 @@ def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, re
         # the spawned vehicle just sits there with nobody "seated" in it,
         # which is why free-cam was the only view available before.
         beamng_client.vehicles.switch(test_vehicle)
+
+        # Free/non-tech sensor - exposes wheel-speed data (wheelspeed per
+        # wheel isn't guaranteed on every vehicle/build, but this pulls in
+        # whatever real per-wheel signals the electrics system publishes).
+        try:
+            test_vehicle.sensors.attach('electrics', Electrics())
+        except Exception:
+            pass
 
         # NOTE: switch() only makes this the "active" vehicle for input/dash
         # purposes - it does not by itself pull the game out of Free Camera
@@ -608,6 +933,34 @@ def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, re
             # run itself should still proceed and produce a result.
             pass
 
+        # AI driving is disabled up front (raw throttle/steering is used
+        # during the actual test - see run_beamng_test()), and the vehicle
+        # is held stationary with the brake here. It just sits ready-and-
+        # loaded in the level until the user presses the accelerator inside
+        # BeamNG itself (see wait_for_native_start()).
+        test_vehicle.ai.set_mode('disabled')
+        test_vehicle.control(throttle=0.0, steering=0.0, brake=1.0)
+
+        return {"status": "Ready", "client": beamng_client, "vehicle": test_vehicle}
+
+    except Exception as e:
+        import traceback
+        # Don't leave a half-initialized connection dangling on error.
+        if 'beamng_client' in locals():
+            try:
+                beamng_client.close()
+            except Exception:
+                pass
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def run_beamng_test(beamng_client, test_vehicle):
+    """Drive the already-loaded/spawned vehicle through the timed test run
+    and collect telemetry. Call load_beamng_scenario() first and pass its
+    returned client/vehicle in here - the timer and average-speed window
+    both start at the top of this function, not at scenario load, which is
+    the whole point of separating the two steps."""
+    try:
         # Drive the vehicle forward directly via raw throttle/steering input,
         # instead of BeamNG's built-in AI driver. ai.set_mode('speed') only
         # works when the vehicle is on a road BeamNG's navgraph recognizes -
@@ -631,7 +984,6 @@ def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, re
                 brake = min(1.0, max(0.0, -speed_error * SPEED_CONTROL_GAIN))
                 return 0.0, brake
 
-        test_vehicle.ai.set_mode('disabled')
         # Initial nudge to get it rolling before the first speed reading comes in.
         test_vehicle.control(throttle=0.6, steering=0.0, brake=0.0)
 
@@ -660,7 +1012,26 @@ def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, re
             "pos_z": [],
             "throttle": [],
             "brake": [],
+            "avg_wheel_av": [],  # real per-wheel-derived signal from the Electrics sensor, where available
         }
+
+        # Live view: a placeholder redrawn periodically during the loop so
+        # you can watch the run instead of only seeing results at the end.
+        # Redrawing a matplotlib figure on every single 20ms poll (50Hz)
+        # would badly bottleneck the control loop, so redraws are throttled
+        # to a fixed wall-clock interval instead of every sample.
+        live_chart_placeholder = st.empty()
+        LIVE_CHART_UPDATE_INTERVAL_S = 0.25
+        last_chart_update_time = 0.0
+
+        # If BeamNG stops responding for this many consecutive polls
+        # (roughly DISCONNECT_FAILURE_LIMIT * BEAMNG_POLL_INTERVAL seconds -
+        # about 1s by default), treat it as the game having been closed
+        # manually mid-run rather than silently finishing out the loop with
+        # no new data and reporting a bogus "Success".
+        DISCONNECT_FAILURE_LIMIT = 50
+        consecutive_failures = 0
+        connection_lost = False
 
         while time.time() - start_time < BEAMNG_TEST_DURATION:
             try:
@@ -689,6 +1060,9 @@ def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, re
                     previous_sample_time = current_time
 
                     vehicle_pos = state_data.get('pos', (None, None, None))
+                    electrics_data = getattr(test_vehicle, 'electrics', None) or {}
+                    avg_wheel_av = electrics_data.get('avg_wheel_av') if isinstance(electrics_data, dict) else None
+
                     telemetry["elapsed_s"].append(time.time() - start_time)
                     telemetry["vertical_g"].append(sample_vertical_g)
                     telemetry["speed_mps"].append(horizontal_speed)
@@ -697,10 +1071,51 @@ def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, re
                     telemetry["pos_z"].append(vehicle_pos[2])
                     telemetry["throttle"].append(throttle_cmd)
                     telemetry["brake"].append(brake_cmd)
+                    telemetry["avg_wheel_av"].append(avg_wheel_av)
+
+                    now = time.time()
+                    if now - last_chart_update_time >= LIVE_CHART_UPDATE_INTERVAL_S:
+                        last_chart_update_time = now
+                        live_fig, live_height_ax = plt.subplots(figsize=(8, 3))
+                        live_height_ax.plot(telemetry["elapsed_s"], telemetry["pos_z"], color="royalblue", linewidth=1.3)
+                        live_height_ax.set_xlabel("Time (s)")
+                        live_height_ax.set_ylabel("Height (m)")
+                        live_height_ax.set_title(
+                            f"Live: Chassis Height (Up/Down) - "
+                            f"{telemetry['elapsed_s'][-1]:.1f}s / {BEAMNG_TEST_DURATION}s"
+                        )
+                        live_height_ax.grid(True, linestyle="--", alpha=0.6)
+                        live_fig.tight_layout()
+                        live_chart_placeholder.pyplot(live_fig)
+                        plt.close(live_fig)
+                consecutive_failures = 0
             except Exception:
-                pass
+                consecutive_failures += 1
+                if consecutive_failures >= DISCONNECT_FAILURE_LIMIT:
+                    connection_lost = True
+                    break
 
             time.sleep(BEAMNG_POLL_INTERVAL)
+
+        live_chart_placeholder.empty()
+
+        if connection_lost:
+            # The game vanished mid-run (e.g. closed manually) - the client
+            # object is no longer good for anything, so don't try to pause()
+            # through it or hand it back to the UI as if the session were
+            # still open. Report this plainly instead of returning a
+            # "Success" built from a truncated/stale telemetry log.
+            return {
+                "error": (
+                    "Lost connection to BeamNG during the test - it looks like the "
+                    "game was closed or crashed mid-run. Partial telemetry "
+                    f"({len(telemetry['elapsed_s'])} samples over "
+                    f"{telemetry['elapsed_s'][-1]:.1f}s) was collected before the "
+                    "connection dropped, but the run wasn't completed."
+                ),
+                "connection_lost": True,
+                "partial_telemetry": telemetry,
+            }
 
         # Bring the car to a stop, then pause the sim and leave the
         # connection open (rather than closing it) so the user can inspect
@@ -736,13 +1151,123 @@ def run_beamng_validation(front_spring_rate, front_damping, rear_spring_rate, re
 
     except Exception as e:
         import traceback
-        # Don't leave a half-initialized connection dangling on error.
-        if 'beamng_client' in locals():
-            try:
-                beamng_client.close()
-            except Exception:
-                pass
+        # Unlike load_beamng_scenario(), we deliberately do NOT close
+        # beamng_client here on error - the scenario is already loaded and
+        # the connection is stashed in session state, so the user can still
+        # inspect what happened in-game and use "Terminate BeamNG Session"
+        # to close it explicitly, rather than losing the loaded level.
         return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def wait_for_native_start(beamng_client, test_vehicle, poll_interval=0.05,
+                           throttle_threshold=0.08, speed_threshold_mps=0.3,
+                           timeout_s=None, disconnect_failure_limit=40):
+    """Block until the player triggers the start from *inside BeamNG itself*
+    - by pressing the accelerator - rather than from a button on the
+    Streamlit site. This is the "native start menu" step: once the level is
+    loaded (see load_beamng_scenario()), the only remaining action needed
+    to kick off the timed run happens in-game, not on the website.
+
+    Lifts the pause load_beamng_scenario() put the sim into, so the player
+    can actually move the car once they're ready.
+
+    Polls two independent signals each tick so this doesn't depend on one
+    exact Electrics field name matching this BeamNG build:
+      1. The Electrics sensor's raw pedal input (throttle_input, falling
+         back to throttle if that key isn't present on this build).
+      2. Actual chassis speed picked up from the free `state` sensor, in
+         case the input field is named/reported differently - if the car
+         is already moving under its own power, that counts as "started"
+         too.
+
+    Returns "started" once the accelerator is detected, "timeout" if
+    timeout_s elapses first (only relevant if a timeout is supplied - the
+    default is to wait indefinitely), or "disconnected" if BeamNG stops
+    responding for disconnect_failure_limit consecutive polls in a row -
+    e.g. the game window was closed manually while we were waiting.
+    """
+    try:
+        beamng_client.resume()
+    except Exception:
+        pass
+
+    status_placeholder = st.empty()
+    waited = 0.0
+    consecutive_failures = 0
+    try:
+        while True:
+            try:
+                test_vehicle.sensors.poll()
+                electrics_data = getattr(test_vehicle, 'electrics', None) or {}
+                raw_throttle = electrics_data.get('throttle_input', electrics_data.get('throttle', 0.0)) or 0.0
+
+                state_data = getattr(test_vehicle, 'state', None)
+                current_speed = 0.0
+                if state_data and isinstance(state_data, dict) and 'vel' in state_data:
+                    vx, vy = state_data['vel'][0], state_data['vel'][1]
+                    current_speed = (vx ** 2 + vy ** 2) ** 0.5
+                consecutive_failures = 0
+            except Exception:
+                raw_throttle, current_speed = 0.0, 0.0
+                consecutive_failures += 1
+                if consecutive_failures >= disconnect_failure_limit:
+                    status_placeholder.empty()
+                    return "disconnected"
+
+            status_placeholder.info(
+                "🎮 Scenario loaded - press the accelerator in BeamNG to start the "
+                f"timed test. ({waited:.0f}s waiting)"
+            )
+
+            if raw_throttle >= throttle_threshold or current_speed >= speed_threshold_mps:
+                status_placeholder.empty()
+                return "started"
+
+            if timeout_s is not None and waited >= timeout_s:
+                status_placeholder.empty()
+                return "timeout"
+
+            time.sleep(poll_interval)
+            waited += poll_interval
+    finally:
+        status_placeholder.empty()
+
+
+def _run_native_start_and_test(client, vehicle):
+    """Shared helper: wait for the player to press the accelerator inside
+    BeamNG, then run the timed test if they did. Used by both the initial
+    "Load Scenario" click and the "Resume Waiting" fallback so disconnect/
+    timeout handling only has to live in one place."""
+    outcome = wait_for_native_start(client, vehicle)
+
+    if outcome == "disconnected":
+        st.session_state.last_bng_result = {
+            "error": (
+                "Lost connection to BeamNG while waiting for you to start the "
+                "test - it looks like the game was closed or crashed before "
+                "the accelerator was pressed."
+            ),
+            "connection_lost": True,
+        }
+        st.session_state.active_bng_client = None
+        st.session_state.active_bng_vehicle = None
+        st.session_state.bng_scenario_loaded = False
+        return
+
+    if outcome == "timeout":
+        # Scenario stays loaded and ready - nothing to do here.
+        return
+
+    # outcome == "started"
+    with st.spinner("Running timed AI test drive..."):
+        validation_result = run_beamng_test(client, vehicle)
+    st.session_state.last_bng_result = validation_result
+    st.session_state.bng_scenario_loaded = False
+    if validation_result.get("connection_lost"):
+        # The client is dead - don't leave it in session state as if the
+        # game were still sitting open and pausable.
+        st.session_state.active_bng_client = None
+        st.session_state.active_bng_vehicle = None
 
 
 # ==========================================
@@ -773,6 +1298,15 @@ if "active_bng_vehicle" not in st.session_state:
     st.session_state.active_bng_vehicle = None
 if "last_bng_result" not in st.session_state:
     st.session_state.last_bng_result = None
+
+# Tracks the scenario "start menu" state: True once load_beamng_scenario()
+# has successfully loaded the level and spawned the vehicle but the timed
+# test hasn't been started yet. Flips back to False once run_beamng_test()
+# runs (or a session is terminated), so the UI knows whether to show
+# "Load Scenario", the in-game "waiting for accelerator" state, or the
+# finished results.
+if "bng_scenario_loaded" not in st.session_state:
+    st.session_state.bng_scenario_loaded = False
 
 st.sidebar.header("Optimization Profile")
 selected_profile = st.sidebar.selectbox(
@@ -822,20 +1356,86 @@ with column_right:
     if is_valid_path:
         st.success(f"BeamNG Detected: `{current_bng_home}`")
 
-        if st.button("Run Automated BeamNG Test Lap"):
-            with st.spinner("Launching BeamNG and running automated AI test drive..."):
-                validation_result = run_beamng_validation(
-                    front_spring_input, front_damping_input, rear_spring_input, rear_damping_input,
-                    bng_home=current_bng_home
-                )
-            st.session_state.last_bng_result = validation_result
+        scenario_ready = (
+            st.session_state.active_bng_client is not None
+            and st.session_state.bng_scenario_loaded
+        )
 
-        # Placed AFTER the run button's block (not before) so that when a
+        if st.session_state.active_bng_client is None:
+            # --- Scenario start menu, step 1: load the level ---------------
+            # This is the one and only website button in the flow - it has
+            # to be, since it's what launches the external BeamNG process in
+            # the first place. Everything after this happens in-game: once
+            # the level and car are loaded, the script blocks and waits for
+            # the player to press the accelerator inside BeamNG itself
+            # (wait_for_native_start) before the timed run begins, so
+            # there's no separate "Start Test" button on the site.
+            st.caption(
+                "Loads the level and spawns the car. Once it's loaded, "
+                "start the timed test by pressing the accelerator inside "
+                "BeamNG - not from a button here - so level load time "
+                "doesn't get counted in the average speed."
+            )
+            if st.button("📥 Load Scenario"):
+                with st.spinner("Launching BeamNG and loading scenario..."):
+                    load_result = load_beamng_scenario(bng_home=current_bng_home)
+
+                if "error" in load_result:
+                    st.session_state.last_bng_result = load_result
+                    st.session_state.bng_scenario_loaded = False
+                else:
+                    client, vehicle = load_result["client"], load_result["vehicle"]
+                    st.session_state.active_bng_client = client
+                    st.session_state.active_bng_vehicle = vehicle
+                    st.session_state.bng_scenario_loaded = True
+                    st.session_state.last_bng_result = None
+
+                    # Blocks until the player presses the accelerator in
+                    # BeamNG (or the connection drops) - see
+                    # _run_native_start_and_test() / wait_for_native_start().
+                    # If it comes back without starting (only possible on a
+                    # disconnect, since no timeout is set by default), the
+                    # scenario just stays loaded - the "Resume Waiting"
+                    # control below covers picking it back up after e.g. a
+                    # page refresh.
+                    _run_native_start_and_test(client, vehicle)
+                st.rerun()
+
+        elif scenario_ready:
+            # --- Scenario is loaded but the blocking wait above got
+            # interrupted (e.g. the browser tab was refreshed mid-wait) -
+            # this is a fallback to resume it, not the primary flow. In
+            # normal use the "Load Scenario" click above already waits for
+            # and runs the test in one go.
+            st.info(
+                "✅ Scenario loaded and vehicle spawned. Press the "
+                "accelerator in BeamNG to start the timed test."
+            )
+            resume_col, cancel_col = st.columns([2, 1])
+            with resume_col:
+                if st.button("🎮 Resume Waiting for BeamNG Start"):
+                    client = st.session_state.active_bng_client
+                    vehicle = st.session_state.active_bng_vehicle
+                    _run_native_start_and_test(client, vehicle)
+                    st.rerun()
+            with cancel_col:
+                if st.button("✖ Cancel"):
+                    try:
+                        st.session_state.active_bng_client.close()
+                    except Exception:
+                        pass
+                    st.session_state.active_bng_client = None
+                    st.session_state.active_bng_vehicle = None
+                    st.session_state.bng_scenario_loaded = False
+                    st.rerun()
+
+        # Placed AFTER the load button's block (not before) so that when a
         # test just finished above, this reads the freshly-updated session
         # state in the SAME script pass and shows the button immediately -
-        # no rerun needed. (Checking this before the run button meant it
-        # always evaluated against the state from before the click.)
-        if st.session_state.active_bng_client is not None:
+        # no rerun needed. Only shown once the timed test has actually run -
+        # while the scenario is merely loaded-and-waiting, the "Cancel"
+        # button above covers closing the session instead.
+        if st.session_state.active_bng_client is not None and not st.session_state.bng_scenario_loaded:
             st.info("A BeamNG test session is open and paused in-game.")
             if st.button("⏹ Terminate BeamNG Session"):
                 try:
@@ -854,10 +1454,14 @@ with column_right:
                     with st.expander("Full traceback"):
                         st.code(validation_result["traceback"])
             else:
-                st.success(
-                    "Automated test lap completed successfully! BeamNG is now paused - "
-                    "use 'Terminate BeamNG Session' above when you're done inspecting it."
-                )
+                session_still_open = st.session_state.active_bng_client is not None
+                if session_still_open:
+                    st.success(
+                        "Automated test lap completed successfully! BeamNG is now paused - "
+                        "use 'Terminate BeamNG Session' above when you're done inspecting it."
+                    )
+                else:
+                    st.success("Automated test lap completed successfully. (BeamNG session has been terminated.)")
 
                 metric_col1, metric_col2, metric_col3 = st.columns(3)
                 metric_col1.metric(
@@ -879,43 +1483,46 @@ with column_right:
 
                 telemetry = validation_result.get("telemetry")
                 if telemetry and telemetry.get("elapsed_s"):
-                    telem_fig, (accel_ax, speed_ax) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+                    # Up/down motion, not the top-down path: chassis height
+                    # (world Z, straight from the State sensor) on top, plus
+                    # the derived vertical G-force underneath. BeamNG.drive's
+                    # free (non-tech) API doesn't expose true per-wheel
+                    # suspension travel - that requires BeamNG.tech - so
+                    # chassis height is the most direct real "up/down" signal
+                    # available; it's the same underlying data the vertical
+                    # G-force below is derived from.
+                    telem_fig, (height_ax, accel_ax) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+
+                    height_ax.plot(telemetry["elapsed_s"], telemetry["pos_z"], color="royalblue", linewidth=1.3)
+                    height_ax.set_ylabel("Height (m)")
+                    height_ax.set_title("Chassis Height Over Time (Up/Down)")
+                    height_ax.grid(True, linestyle="--", alpha=0.6)
 
                     accel_ax.plot(telemetry["elapsed_s"], telemetry["vertical_g"], color="crimson", linewidth=1.2)
+                    accel_ax.set_xlabel("Time (seconds)")
                     accel_ax.set_ylabel("Vertical G-Force")
                     accel_ax.set_title("BeamNG Measured Vertical G-Force Over Time")
                     accel_ax.grid(True, linestyle="--", alpha=0.6)
-
-                    speed_ax.plot(telemetry["elapsed_s"], telemetry["speed_mps"], color="royalblue", linewidth=1.5, label="Speed")
-                    speed_ax.axhline(BEAMNG_AI_SPEED, color="gray", linestyle=":", linewidth=1, label="Target Speed")
-                    speed_ax.set_xlabel("Time (seconds)")
-                    speed_ax.set_ylabel("Speed (m/s)")
-                    speed_ax.set_title("Vehicle Speed Over Time")
-                    speed_ax.grid(True, linestyle="--", alpha=0.6)
-                    speed_ax.legend()
 
                     telem_fig.tight_layout()
                     st.pyplot(telem_fig)
                     plt.close(telem_fig)
 
-                    valid_xy = [
-                        (x, y) for x, y in zip(telemetry["pos_x"], telemetry["pos_y"])
-                        if x is not None and y is not None
-                    ]
-                    if valid_xy:
-                        path_fig, path_ax = plt.subplots(figsize=(6, 6))
-                        path_x, path_y = zip(*valid_xy)
-                        path_ax.plot(path_x, path_y, color="darkorange", linewidth=1.5)
-                        path_ax.scatter([path_x[0]], [path_y[0]], color="green", label="Start", zorder=5)
-                        path_ax.scatter([path_x[-1]], [path_y[-1]], color="red", label="End", zorder=5)
-                        path_ax.set_xlabel("World X (m)")
-                        path_ax.set_ylabel("World Y (m)")
-                        path_ax.set_title("Vehicle Path (Top-Down)")
-                        path_ax.set_aspect("equal", adjustable="datalim")
-                        path_ax.grid(True, linestyle="--", alpha=0.6)
-                        path_ax.legend()
-                        st.pyplot(path_fig)
-                        plt.close(path_fig)
+                    wheel_speeds = [v for v in telemetry.get("avg_wheel_av", []) if v is not None]
+                    if wheel_speeds:
+                        wheel_fig, wheel_ax = plt.subplots(figsize=(8, 3))
+                        wheel_ax.plot(telemetry["elapsed_s"][:len(wheel_speeds)], wheel_speeds, color="darkorange", linewidth=1.3)
+                        wheel_ax.set_xlabel("Time (seconds)")
+                        wheel_ax.set_ylabel("Avg. Wheel Angular Velocity (rad/s)")
+                        wheel_ax.set_title("Wheel Speed Over Time (from Electrics sensor)")
+                        wheel_ax.grid(True, linestyle="--", alpha=0.6)
+                        st.pyplot(wheel_fig)
+                        plt.close(wheel_fig)
+                    else:
+                        st.caption(
+                            "No per-wheel data was reported by the Electrics sensor for this "
+                            "vehicle/build - showing chassis-level height and G-force only."
+                        )
 
                     with st.expander("Raw telemetry samples"):
                         st.dataframe(telemetry)
