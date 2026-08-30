@@ -379,7 +379,7 @@ BEAMNG_PORT = 25252
 BEAMNG_MAP = 'gridmap_v2'
 BEAMNG_VEHICLE_MODEL = 'etkc'
 BEAMNG_VEHICLE_LICENSE = 'AI_TEST'
-BEAMNG_SPAWN_POS = (-337.6, -491.3, 100.15)
+BEAMNG_SPAWN_POS = (-2956.696, 1257.925, 100.132)
 # Rotation captured from the World Editor Inspector (rotationEuler Z = 180 deg,
 # X/Y = 0), originally converted straight to quaternion (x, y, z, w) as
 # (0, 0, 1, 0) - a pure 180 deg yaw about Z. In practice that made the car
@@ -391,7 +391,7 @@ BEAMNG_SPAWN_POS = (-337.6, -491.3, 100.15)
 # still facing the wrong way after this, re-check the heading in the World
 # Editor and adjust this quaternion again - a pure yaw of theta degrees
 # about Z is (0, 0, sin(theta/2), cos(theta/2)).
-BEAMNG_SPAWN_ROT_QUAT = (0, 0, 0, 1)
+BEAMNG_SPAWN_ROT_QUAT = (0, 0, 1, 0)
 BEAMNG_IMU_FREQ = 50           
 BEAMNG_TEST_DURATION = 45      
 BEAMNG_POLL_INTERVAL = 0.02    
@@ -410,7 +410,7 @@ BEAMNG_POLL_INTERVAL = 0.02
 # vehicles there) before cone spawning will work. Leaving this as None makes
 # load_beamng_track_scenario() fail fast with a clear message instead of
 # silently spawning nothing or crashing deep inside scenario.make().
-BEAMNG_CONE_PROP_MODEL = None  # e.g. "party_cone" / "cone" - CONFIRM IN-GAME
+BEAMNG_CONE_PROP_MODEL = "small"  # e.g. "party_cone" / "cone" - CONFIRM IN-GAME
 DEFAULT_TRACK_WIDTH_M = 8.0
 DEFAULT_TRACK_SPEED_MPS = 14.0
 DEFAULT_CONE_SPACING_M = 5.0
@@ -1219,6 +1219,8 @@ def load_beamng_scenario(bng_home=None):
         spawn_success = beamng_client.vehicles.spawn(
             test_vehicle, pos=BEAMNG_SPAWN_POS, rot_quat=BEAMNG_SPAWN_ROT_QUAT, connect=True
         )
+        # Force the simulator focus and camera to jump onto the vehicle
+        test_vehicle.switch()
         if not spawn_success:
             beamng_client.close()
             return {"error": "beamng_client.vehicles.spawn() reported failure - vehicle did not spawn."}
@@ -1510,6 +1512,18 @@ def wait_for_native_start(beamng_client, test_vehicle, poll_interval=0.05,
     """
     try:
         beamng_client.resume()
+        
+        # ---> FIX: Apply camera focus and mode right here after resuming, 
+        # so BeamNG processes the view switch while unpaused.
+        beamng_client.vehicles.switch(test_vehicle)
+        available_camera_modes = beamng_client.camera.get_player_modes(test_vehicle)
+        preferred_modes = ["onboard", "driver", "hood", "chase", "orbit"]
+        chosen_mode = next(
+            (m for m in preferred_modes if m in available_camera_modes),
+            None,
+        )
+        if chosen_mode:
+            beamng_client.camera.set_player_mode(test_vehicle, chosen_mode, config={})
     except Exception:
         pass
 
@@ -1786,8 +1800,9 @@ def run_beamng_track_test(beamng_client, test_vehicle, track: TrackDefinition, a
         script_duration = ai_script[-1]["t"] if ai_script else 0.0
         if max_duration_s is None:
             max_duration_s = script_duration * 1.5 + 10.0
+  
 
-        test_vehicle.ai.execute_script(ai_script, cling=True, start_delay=0.0)
+        test_vehicle.ai.set_script(ai_script, cling=True)
 
         telemetry = {
             "elapsed_s": [], "sim_time_s": [], "pos_x": [], "pos_y": [], "pos_z": [],
