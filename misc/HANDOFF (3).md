@@ -4,21 +4,154 @@ This file is for whoever (human or agent) picks this project up next. It
 covers what the app does, what was just changed, why, and what's still
 open. Read this before touching `MAIN.py`.
 
-## Most recent work: real cone prop path, run-up cones, 4x-scaled figure-8 track
+## Most recent work: cone spawn fixed for beamngpy versions without `safe_spawn`
+
+**Symptom reported by the user:** every single cone failed to spawn with
+the identical error `VehiclesApi.spawn() got an unexpected keyword
+argument 'safe_spawn'` (0/171 spawned) - a real regression from the
+previous fix, not a live-BeamNG-specific issue.
+
+**Root cause:** the previous fix hardcoded `safe_spawn=True` in the cone
+spawn call, based on inspecting beamngpy 1.36's source (which does have
+that parameter - it's the renamed replacement for the older `cling: bool`,
+kept there as a deprecated alias). The user's actually-installed beamngpy
+version doesn't have `safe_spawn` at all - it's evidently old enough to
+only know `cling` (or possibly neither), so the parameter name itself was
+wrong for their environment. Since this was a hardcoded kwarg on every
+single spawn call, every single cone failed identically.
+
+**What changed (`MAIN.py`):** before the cone-spawn loop,
+`load_beamng_track_scenario()` now inspects
+`beamng_client.vehicles.spawn`'s actual signature via `inspect.signature()`
+and builds the "let the game snap this to the ground" kwarg dict from
+whichever name is actually present (`safe_spawn` preferred, `cling` as a
+fallback, neither if the installed version has neither) - once, not
+per-cone. New top-level `import inspect`.
+
+### How this was verified
+
+No live BeamNG here (same caveat as everything else), but the
+signature-detection logic itself was tested directly against three fake
+`spawn()` signatures standing in for old/new/very-old beamngpy - a
+`safe_spawn`-only signature, a `cling`-only signature, and a signature with
+neither - confirming the right kwarg (or no kwarg) gets attached in each
+case without ever passing an unsupported keyword.
+`python3 -m py_compile MAIN.py` / `ast.parse` both pass on the full file.
+**Not verified:** which of the three cases the user's actual installed
+beamngpy version falls into - if cones still fail to spawn after this with
+a *different* error (not the same "unexpected keyword argument" message),
+that's a genuinely new failure mode, not this same root cause recurring.
+
+## Earlier work: camera snaps to orbit at spawn, not at "Run AI Lap"
+
+**Symptom reported by the user:** the camera stayed on BeamNG's own
+default (effectively free-cam) from the moment "Load Track Scenario"
+finished until "Run AI Lap" was pressed - it should snap onto the car in
+orbit mode as soon as the car spawns instead.
+
+**What changed (`MAIN.py`):** `resume_and_focus_camera()` used to do two
+things at once - resume the sim *and* switch the camera - with no way to
+get one without the other. It's now a thin wrapper: the actual
+vehicle-switch + camera-mode logic moved into a new `set_camera_mode(beamng_client, test_vehicle, preferred_modes)`,
+which doesn't touch the sim's pause state at all.
+`load_beamng_track_scenario()` now calls `set_camera_mode(..., ["orbit"])`
+right after the vehicle and cones are in place (while the sim is still
+deliberately paused for setup), so the camera lands in orbit mode the
+moment the scenario finishes loading. "Run AI Lap" still calls
+`resume_and_focus_camera()` as before (unchanged preferred-mode order,
+onboard first) to actually resume physics and give a good in-car view
+once the lap starts - only the *first* camera snap moved earlier, the
+run-time behavior didn't change. A camera-focus failure at spawn now
+shows up as a `camera_warning` key/`st.warning()` next to the existing
+cone one, rather than being silent.
+
+### How this was verified
+
+No live BeamNG here (same caveat as everything else) - `set_camera_mode()`/
+`resume_and_focus_camera()` were read through for correctness (no dangling
+old code paths, no double-resume, the extracted function's signature/
+defaults match every existing call site) and `python3 -m py_compile MAIN.py`
+/ `ast.parse` both pass on the full file. **Not verified:** whether "orbit"
+is a valid mode name returned by `camera.get_player_modes()` on this
+build (it's already in the existing preferred-mode list used elsewhere in
+this file, so it's expected to be, but hasn't been independently
+re-confirmed), and whether switching camera mode while the sim is paused
+actually takes visible effect immediately versus only becoming visible on
+resume - if the camera doesn't visibly move until "Run AI Lap" despite this
+change, that pause/camera-mode interaction is the next thing to check
+in-game.
+
+## Earlier work: cones actually spawn now (live vehicles, not prefab StaticObjects), run-up cones, 4x-scaled figure-8 track
 
 **Symptoms reported by the user:** (1) the figure-8 track was too small,
-(2) cones did not spawn at all, (3) the run-up lane (see
-`RUN_UP_DISTANCE_M`/`compute_run_up_start()`) had no cones of its own.
+(2) cones did not spawn at all - still true even after the first attempted
+fix below, (3) the run-up lane (see `RUN_UP_DISTANCE_M`/
+`compute_run_up_start()`) had no cones of its own.
 
-**Cone spawn fix:** `BEAMNG_CONE_PROP_MODEL` was left at the placeholder
-`"small"` from the original integration work - not a real shape path, so
-`StaticObject(shape=...)` calls "succeeded" against garbage and nothing
-rendered in-world. The user confirmed the real part path in-game:
-`vehicles/cones/small_orange_white_single.pc`. `BEAMNG_CONE_PROP_MODEL` is
-now set to that. **Still not independently re-verified against a live
-BeamNG instance from this side** (same "no beamngpy/no network here" caveat
-as the rest of this project) - confirm `cones_confirmed` reads a nonzero
-number on the next in-game run.
+**First attempted cone fix (insufficient on its own):** `BEAMNG_CONE_PROP_MODEL`
+was left at the placeholder `"small"` from the original integration work -
+not a real path at all. The user confirmed the real part path in-game:
+`vehicles/cones/small_orange_white_single.pc`, and `BEAMNG_CONE_PROP_MODEL`
+was updated to it. **This alone did not fix cone spawning** (user-reported:
+cones still missing) - fixing the path string didn't address the actual
+mechanism, below.
+
+**Real root cause, found on a second pass:** cones were being added via
+`scenario.add_object(StaticObject(shape=BEAMNG_CONE_PROP_MODEL, ...))`
+*before* `scenario.make()` - i.e. baked into the scenario prefab. This was
+broken for two independent reasons, and fixing the path string only ever
+had a chance of addressing the second one:
+
+  1. **Prefab-embedded objects are already known broken on this specific
+     BeamNG build.** This project already hit this exact failure mode once
+     before, for the *ego vehicle* in the original suspension-bump flow
+     (see `load_beamng_scenario()`'s "prefab-embedded vehicles" comment,
+     `MAIN.py` ~line 1600) - the fix there was to load an empty scenario
+     and spawn the vehicle live at runtime via `vehicles.spawn()` instead
+     of `scenario.add_vehicle()`. The track/cone flow's ego vehicle spawn
+     already used that same live-spawn pattern (correctly) - but the cones
+     right next to it were still going in through the broken prefab path
+     the whole time. Same root cause, just not yet applied to the cones.
+  2. **`BEAMNG_CONE_PROP_MODEL`'s format is itself a strong signal it was
+     never a `StaticObject` shape in the first place.** A path shaped like
+     `vehicles/<model>/<part>.pc` is BeamNG's layout for a *vehicle
+     model's part-config file*, not a static-mesh shape path (which
+     `StaticObject(shape=...)` expects) - `.pc` is specifically BeamNG's
+     part-config extension. In other words, cones in this build's asset
+     layout are pseudo-vehicles (spawnable, physical, jbeam-backed
+     objects), the same general category of thing the ego vehicle is, not
+     fixed scenery.
+
+**The actual fix (`load_beamng_track_scenario()` in `MAIN.py`):** cones are
+now spawned live, exactly like the ego vehicle, each as its own `Vehicle`
+instance (`model=BEAMNG_CONE_VEHICLE_MODEL` - new constant, `"cones"`,
+the vehicle-model folder implied by `BEAMNG_CONE_PROP_MODEL`'s path -
+`part_config=BEAMNG_CONE_PROP_MODEL`), via `beamng_client.vehicles.spawn()`
+right after the ego vehicle is confirmed in place, with `connect=False`
+(a decorative cone needs no sensors/control, and connecting 100+ of them
+would be pure overhead) and `safe_spawn=True` (lets the game snap each one
+to the ground - unlike the ego vehicle's `start_pos`, a cone landing a few
+centimeters off doesn't matter). The old `scenario.add_object(StaticObject(...))`
+call before `scenario.make()` is gone entirely.
+
+`cones_confirmed` in the result dict is now an *exact* count of successful
+`vehicles.spawn()` calls, replacing the old best-effort
+`find_static_objects`/`find_objects_class` guess (which was itself a
+symptom of not being sure the StaticObject approach worked at all). A
+`cone_warning` is set (without aborting the run) if any individual cone
+fails to spawn.
+
+**Still not independently re-verified against a live BeamNG instance from
+this side** (same "no beamngpy/no network here" caveat as the rest of this
+project, though beamngpy 1.36 itself - matching the version pin mentioned
+elsewhere in this file - was installed and inspected directly to confirm
+`Vehicle.__init__`'s `part_config` parameter and `VehiclesApi.spawn()`'s
+signature/behavior match what this fix assumes). Confirm on the next
+in-game run that `cones_confirmed` reads the full requested count, that
+cones are actually visible/collidable, and that the `"cones"` vehicle
+model name is exactly right for this install (if spawning still fails,
+this is the next thing to check in-game - the in-game vehicle selector
+should show a vehicle whose folder cones live under).
 
 **Run-up cones:** `generate_cone_positions()` only ever walked the track's
 own points, so the run-up stretch the car spawns on and drives through
@@ -51,27 +184,37 @@ per-segment speed targets.
 
 ### How this was verified
 
-Same standalone-extraction technique as the rest of this project (no
-`beamngpy`/`streamlit` here): `compute_run_up_geometry()`,
-`generate_run_up_cone_positions()`, and `generate_all_cone_positions()`
-were extracted into a throwaway script and run against the actual
-(scaled) `figure8_track.csv`:
+Same standalone-extraction technique as the rest of this project (no live
+BeamNG game here, only `beamngpy` itself, which - unlike a running game -
+*is* installable in this sandbox and was used directly for verification
+this time):
 
-- `generate_all_cone_positions()` on the real track correctly identified
-  and dropped exactly one main-track boundary cone that fell inside the
-  run-up lane.
-- Scanning every cone in the combined output, none sit within 1 m of the
-  run-up lane's centerline (i.e. none would physically block the car's
-  path from its spawn point to the track's first point).
+- `compute_run_up_geometry()`, `generate_run_up_cone_positions()`, and
+  `generate_all_cone_positions()` were extracted into a throwaway script
+  and run against the actual (scaled) `figure8_track.csv`:
+  correctly identified and dropped exactly one main-track boundary cone
+  that fell inside the run-up lane, and scanning every cone in the
+  combined output, none sit within 1 m of the run-up lane's centerline.
+- `pip install beamngpy` (1.36 - matching this project's existing version
+  pin) was used to directly inspect `Vehicle.__init__` and
+  `VehiclesApi.spawn()`'s source, confirming: `part_config` is passed
+  through to the game as a plain string field (no reformatting that would
+  choke on the `vehicles/.../....pc` path), `spawn()`'s `connect` and
+  `safe_spawn` parameters behave as this fix assumes, and - importantly -
+  beamngpy 1.36 has **no** runtime API for spawning a generic static prop
+  at all (`ScenarioApi` has no `add_object`/`spawn_object` equivalent,
+  only the prefab-time `Scenario.add_object()`), which is what ruled out
+  "just live-spawn a StaticObject instead" as an option and pointed at
+  spawning cones as vehicles instead.
 - `python3 -m py_compile MAIN.py` passes on the full file.
 
-**Not verified:** anything requiring a live BeamNG instance - in
-particular, whether `vehicles/cones/small_orange_white_single.pc` is
-accepted by `StaticObject`/`scenario.make()` as-is (some BeamNG
-versions want the model name without the `vehicles/.../` prefix or
-without the `.pc` extension - if cones still don't appear, that prefix/
-extension is the first thing to try stripping), and whether the run-up
-cone spacing/width looks right driving it in-game.
+**Not verified:** anything requiring the actual running game - in
+particular, whether `"cones"` is the exact right vehicle-model folder name
+for this BeamNG install (only the *part config path* was confirmed
+in-game by the user; the model name was inferred from that path's
+`vehicles/<model>/...` structure, which is normally reliable but hasn't
+been independently double-checked against the in-game vehicle selector),
+and whether the run-up cone spacing/width looks right driving it in-game.
 
 ## Earlier work: start/finish line auto-stop + a real run timeout for the track/cone AI mode
 

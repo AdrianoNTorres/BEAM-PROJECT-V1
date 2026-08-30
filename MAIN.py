@@ -20,6 +20,31 @@ Pipeline:
        against a much higher-fidelity simulation.
 
 Everything is wired up in a Streamlit dashboard for interactive tuning.
+
+How this file is organized (read top to bottom):
+    The file is split into the five numbered sections marked with "====="
+    banners below: (1) the physics simulator, (1.5) track/cone geometry,
+    (2) the BeamNG bridge for the suspension-bump test, (2.5) the BeamNG
+    bridge for the track/cone AI-driving test, and (3) the Streamlit UI
+    script that ties everything together and is what actually runs when
+    you launch the app.
+
+    Within each section, functions/methods are ordered so that a function
+    appears ABOVE the helper functions it calls - e.g. simulate_bump()
+    (the main entry point of the simulator) appears right after __init__,
+    with the lower-level math it depends on (compute_static_equilibrium,
+    calculate_system_equations, compute_realism_penalties, ...) below it.
+    The idea is that you can read a section start-to-finish, top to bottom,
+    the same way you'd trace a call stack, instead of having to jump
+    around the file to find out what a function actually does.
+    One exception: TrackPoint/TrackDefinition (section 1.5) are simple
+    data classes referenced by type hints throughout that section, so -
+    like a struct definition - they're placed before everything that uses
+    them rather than being ordered by who calls whom.
+    Section 3 (the Streamlit script) is different: it's a linear script
+    that builds the UI top-to-bottom and relies on variables/widgets set
+    up earlier in the script, so its statements stay in their original,
+    execution order rather than being reshuffled by call graph.
 """
 
 import os
@@ -29,6 +54,7 @@ import json
 import math
 import random
 import time
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -193,7 +219,7 @@ CUSTOM_DAMPING_RANGE_ABSOLUTE_LIMITS = (0, 100000)     # Ns/m
 
 # --- Vehicle Layout & Fundamental Physical Constants ---
 # BEAMNG ETK800 AS REFERENCE
-BEAMNG_AI_SPEED = 15.0         
+BEAMNG_AI_SPEED = 50.0         
 CHASSIS_SPRUNG_MASS = 1455.0   
 FRONT_UNSPRUNG_MASS = 40.0     
 REAR_UNSPRUNG_MASS = 40.0      
@@ -444,7 +470,7 @@ TRACK_WORLD_ORIGIN_XY = (BEAMNG_SPAWN_POS[0], BEAMNG_SPAWN_POS[1])
 # which is perpendicular to the gate itself (see compute_finish_line() /
 # compute_run_up_start()), so the car meets the line squared-up rather
 # than at an angle. Set to 5.0 m per the user's requested spawn gap.
-RUN_UP_DISTANCE_M = 5.0
+RUN_UP_DISTANCE_M = 25.0
 TRACK_HEADING_ROT_OFFSET_DEG = 0.0
 
 # --- Start/finish line + run-timeout settings (see compute_finish_line()
@@ -483,13 +509,19 @@ TELEPORT_Z_CLEARANCE_M = 0.15
 # free-license-only sensors) but drives a track loaded from a CSV/JSON file
 # instead of a single fixed bump.
 #
-# Confirmed in-game by the user: the real part path for the small
-# orange/white traffic cone prop on this BeamNG install. This used to be
-# left as the placeholder "small", which is not a real shape path - that,
-# not the StaticObject/scenario logic below, was why cones never actually
-# appeared in-world (the add_object() calls "succeeded" against a garbage
-# shape and BeamNG silently rendered nothing for it).
+# Confirmed in-game by the user: the real part-config path for the small
+# orange/white traffic cone on this BeamNG install. This used to be left as
+# the placeholder "small", which wasn't a real path at all - but the path
+# format itself ("vehicles/cones/...") is also the reason cones are spawned
+# as their own Vehicle instances below (load_beamng_track_scenario()),
+# not as scenario StaticObjects like an earlier version of this file tried:
+# "vehicles/<model>/<part>.pc" is BeamNG's layout for a vehicle model's part
+# config, not a static-mesh shape path, so cones in this build's asset
+# layout are pseudo-vehicles (spawnable, physical, jbeam-backed) rather than
+# fixed decoration - which also means BEAMNG_CONE_VEHICLE_MODEL right below
+# has to match ("cones", the folder this part config lives under).
 BEAMNG_CONE_PROP_MODEL = "vehicles/cones/small_orange_white_single.pc"
+BEAMNG_CONE_VEHICLE_MODEL = "cones"
 DEFAULT_TRACK_WIDTH_M = 8.0
 DEFAULT_TRACK_SPEED_MPS = 14.0
 DEFAULT_CONE_SPACING_M = 5.0
@@ -573,6 +605,11 @@ BO_INITIAL_GUESS = [
 # 1. THE PHYSICS SIMULATOR (Half-Car Pitch Model)
 # ==========================================
 class HalfCarPitchSimulator:
+    """The core physics model: a 2D "half-car" (bounce + pitch, no roll)
+    driving over a single road bump. simulate_bump() below is the one
+    method everything else in this file calls; the rest of the class is
+    the math it depends on, in the order it's used."""
+
     def __init__(self):
         self.chassis_sprung_mass = CHASSIS_SPRUNG_MASS
         self.front_unsprung_mass = FRONT_UNSPRUNG_MASS
@@ -581,134 +618,15 @@ class HalfCarPitchSimulator:
         self.distance_front_axle = DISTANCE_FRONT_AXLE
         self.distance_rear_axle = DISTANCE_REAR_AXLE
 
-    def compute_damping_ratios(self, front_spring_rate, front_damping, rear_spring_rate, rear_damping):
-        front_sprung_load = self.chassis_sprung_mass * self.distance_rear_axle / WHEELBASE
-        rear_sprung_load = self.chassis_sprung_mass * self.distance_front_axle / WHEELBASE
-        front_critical_damping = 2.0 * np.sqrt(front_spring_rate * front_sprung_load)
-        rear_critical_damping = 2.0 * np.sqrt(rear_spring_rate * rear_sprung_load)
-        front_damping_ratio = front_damping / front_critical_damping
-        rear_damping_ratio = rear_damping / rear_critical_damping
-        return front_damping_ratio, rear_damping_ratio
-
-    def compute_realism_penalties(self, front_spring_rate, front_damping, rear_spring_rate, rear_damping, weights):
-        # Each profile carries its own target/floor now (see PROFILE_WEIGHTS),
-        # rather than every profile sharing one hardcoded comfort-tuned value.
-        spring_rate_min = weights.get("spring_rate_min", 25000.0)
-        damping_ratio_target = weights.get("damping_ratio_target", 0.45)
-        damping_ratio_tolerance = weights.get("damping_ratio_tolerance", 0.20)
-
-        # Underspring penalty: normalized as a fractional shortfall relative
-        # to the floor, so it's O(1) at "zero stiffness" and O(0) at or above
-        # the floor, regardless of what the floor's absolute value is.
-        front_shortfall_frac = max(0.0, spring_rate_min - front_spring_rate) / spring_rate_min
-        rear_shortfall_frac = max(0.0, spring_rate_min - rear_spring_rate) / spring_rate_min
-        underspring_penalty = front_shortfall_frac ** 2 + rear_shortfall_frac ** 2
-
-        # Damping-ratio penalty: normalized in units of "tolerance widths"
-        # past the allowed band around the target, so weight values mean
-        # the same thing across profiles even though targets/tolerances differ.
-        front_damping_ratio, rear_damping_ratio = self.compute_damping_ratios(
-            front_spring_rate, front_damping, rear_spring_rate, rear_damping
-        )
-        damping_ratio_penalty = 0.0
-        for damping_ratio in (front_damping_ratio, rear_damping_ratio):
-            excess_deviation = abs(damping_ratio - damping_ratio_target) - damping_ratio_tolerance
-            if excess_deviation > 0.0:
-                # Cap "tolerance widths past the band" before squaring - see
-                # DAMPING_RATIO_PENALTY_MAX_WIDTHS above. Without this, an
-                # overdamped setup (damping large relative to a soft spring's
-                # small critical damping) has no upper bound on how far past
-                # the band it can sit, and this term alone could reach the
-                # hundreds - dwarfing every actual ride-response measurement
-                # in the cost and making the score reflect "how close to my
-                # assumed target damping ratio" rather than "how the car
-                # actually rides".
-                widths_past_band = min(
-                    excess_deviation / damping_ratio_tolerance, DAMPING_RATIO_PENALTY_MAX_WIDTHS
-                )
-                damping_ratio_penalty += widths_past_band ** 2
-
-        return (
-            weights.get("underspring_penalty", 0.0) * underspring_penalty
-            + weights.get("damping_ratio_penalty", 0.0) * damping_ratio_penalty
-        )
-
-    def compute_static_equilibrium(self, front_spring_rate, rear_spring_rate):
-        def equilibrium_equations(state):
-            vertical_bounce, pitch_angle, front_wheel_displacement, rear_wheel_displacement = state
-            
-            chassis_front_displacement = vertical_bounce - self.distance_front_axle * pitch_angle
-            chassis_rear_displacement = vertical_bounce + self.distance_rear_axle * pitch_angle
-            
-            front_compression = front_wheel_displacement - chassis_front_displacement
-            rear_compression = rear_wheel_displacement - chassis_rear_displacement
-            
-            front_suspension_force = front_spring_rate * front_compression
-            rear_suspension_force = rear_spring_rate * rear_compression
-            
-            front_tire_force = max(0.0, TIRE_STIFFNESS * (0.0 - front_wheel_displacement))
-            rear_tire_force = max(0.0, TIRE_STIFFNESS * (0.0 - rear_wheel_displacement))
-            
-            pitch_torque = (rear_suspension_force * self.distance_rear_axle - front_suspension_force * self.distance_front_axle)
-            
-            return [
-                (front_suspension_force + rear_suspension_force) / self.chassis_sprung_mass - GRAVITY,
-                pitch_torque, 
-                (front_tire_force - front_suspension_force) / self.front_unsprung_mass - GRAVITY,
-                (rear_tire_force - rear_suspension_force) / self.rear_unsprung_mass - GRAVITY,
-            ]
-
-        solution = root(equilibrium_equations, [0.0, 0.0, -0.01, -0.01])
-        return solution.x 
-
-    def calculate_system_equations(self, time_t, state_vector, front_spring_rate, front_damping, rear_spring_rate, rear_damping, road_profile_func, road_velocity_func):
-        (vertical_bounce, vertical_velocity, 
-         pitch_angle, pitch_velocity, 
-         front_wheel_displacement, front_wheel_velocity, 
-         rear_wheel_displacement, rear_wheel_velocity) = state_vector
-        
-        road_height_front = road_profile_func(time_t)
-        road_height_rear = road_profile_func(time_t - REAR_AXLE_ROAD_LAG)
-        road_vel_front = road_velocity_func(time_t)
-        road_vel_rear = road_velocity_func(time_t - REAR_AXLE_ROAD_LAG)
-        
-        chassis_front_displacement = vertical_bounce - self.distance_front_axle * pitch_angle
-        chassis_rear_displacement = vertical_bounce + self.distance_rear_axle * pitch_angle
-        chassis_front_velocity = vertical_velocity - self.distance_front_axle * pitch_velocity
-        chassis_rear_velocity = vertical_velocity + self.distance_rear_axle * pitch_velocity
-        
-        front_compression = front_wheel_displacement - chassis_front_displacement
-        rear_compression = rear_wheel_displacement - chassis_rear_displacement
-        
-        front_comp_velocity = front_wheel_velocity - chassis_front_velocity
-        rear_comp_velocity = rear_wheel_velocity - chassis_rear_velocity
-        
-        front_suspension_force = front_spring_rate * front_compression + front_damping * front_comp_velocity
-        rear_suspension_force = rear_spring_rate * rear_compression + rear_damping * rear_comp_velocity
-        
-        front_tire_compression = road_height_front - front_wheel_displacement
-        rear_tire_compression = road_height_rear - rear_wheel_displacement
-        
-        front_tire_comp_velocity = road_vel_front - front_wheel_velocity
-        rear_tire_comp_velocity = road_vel_rear - rear_wheel_velocity
-        
-        front_tire_force = max(0.0, TIRE_STIFFNESS * front_tire_compression + TIRE_DAMPING * front_tire_comp_velocity)
-        rear_tire_force = max(0.0, TIRE_STIFFNESS * rear_tire_compression + TIRE_DAMPING * rear_tire_comp_velocity)
-        
-        vertical_chassis_acceleration = (front_suspension_force + rear_suspension_force) / self.chassis_sprung_mass - GRAVITY
-        pitch_chassis_acceleration = (rear_suspension_force * self.distance_rear_axle - front_suspension_force * self.distance_front_axle) / self.pitch_inertia 
-        
-        front_wheel_acceleration = (front_tire_force - front_suspension_force) / self.front_unsprung_mass - GRAVITY
-        rear_wheel_acceleration = (rear_tire_force - rear_suspension_force) / self.rear_unsprung_mass - GRAVITY
-        
-        return [
-            vertical_velocity, vertical_chassis_acceleration, 
-            pitch_velocity, pitch_chassis_acceleration, 
-            front_wheel_velocity, front_wheel_acceleration, 
-            rear_wheel_velocity, rear_wheel_acceleration
-        ]
-
     def simulate_bump(self, front_spring_rate, front_damping, rear_spring_rate, rear_damping, profile="Comfort (Smooth Ride)"):
+        """Main entry point: simulate the car driving over the road bump with
+        the given spring/damper settings and return (cost_score, time points,
+        chassis heave response, front wheel height, rear wheel height).
+        cost_score is the scalar the Bayesian Optimization loop minimizes -
+        lower is a smoother/more controlled ride under the given `profile`.
+        Internally this finds the pre-bump static equilibrium, integrates the
+        equations of motion through the bump event, then scores the result
+        against `profile`'s weighted objective terms and realism penalties."""
         # `profile` accepts either a preset name (str, looked up in
         # PROFILE_WEIGHTS) or a fully-formed weights dict (used for the
         # user-defined "Custom" objective built in the sidebar).
@@ -840,7 +758,154 @@ class HalfCarPitchSimulator:
         
         return cost_score, time_evaluation_points, chassis_heave_response, front_height_response, rear_height_response
 
+    def compute_static_equilibrium(self, front_spring_rate, rear_spring_rate):
+        """Find the car's resting position (ride height + pitch) under its own
+        weight, before the bump event, by solving for the state where every
+        net force/torque is zero. simulate_bump() starts its time integration
+        from this equilibrium rather than from an arbitrary zero state."""
+        def equilibrium_equations(state):
+            vertical_bounce, pitch_angle, front_wheel_displacement, rear_wheel_displacement = state
+            
+            chassis_front_displacement = vertical_bounce - self.distance_front_axle * pitch_angle
+            chassis_rear_displacement = vertical_bounce + self.distance_rear_axle * pitch_angle
+            
+            front_compression = front_wheel_displacement - chassis_front_displacement
+            rear_compression = rear_wheel_displacement - chassis_rear_displacement
+            
+            front_suspension_force = front_spring_rate * front_compression
+            rear_suspension_force = rear_spring_rate * rear_compression
+            
+            front_tire_force = max(0.0, TIRE_STIFFNESS * (0.0 - front_wheel_displacement))
+            rear_tire_force = max(0.0, TIRE_STIFFNESS * (0.0 - rear_wheel_displacement))
+            
+            pitch_torque = (rear_suspension_force * self.distance_rear_axle - front_suspension_force * self.distance_front_axle)
+            
+            return [
+                (front_suspension_force + rear_suspension_force) / self.chassis_sprung_mass - GRAVITY,
+                pitch_torque, 
+                (front_tire_force - front_suspension_force) / self.front_unsprung_mass - GRAVITY,
+                (rear_tire_force - rear_suspension_force) / self.rear_unsprung_mass - GRAVITY,
+            ]
 
+        solution = root(equilibrium_equations, [0.0, 0.0, -0.01, -0.01])
+        return solution.x 
+
+    def calculate_system_equations(self, time_t, state_vector, front_spring_rate, front_damping, rear_spring_rate, rear_damping, road_profile_func, road_velocity_func):
+        """The ODE right-hand side (F = m*a for each of the 4 masses: chassis
+        bounce, chassis pitch, front wheel, rear wheel) that simulate_bump()
+        hands to scipy's solve_ivp to integrate the car's motion through the
+        bump event. Returns the state vector's time-derivative at time_t."""
+        (vertical_bounce, vertical_velocity, 
+         pitch_angle, pitch_velocity, 
+         front_wheel_displacement, front_wheel_velocity, 
+         rear_wheel_displacement, rear_wheel_velocity) = state_vector
+        
+        road_height_front = road_profile_func(time_t)
+        road_height_rear = road_profile_func(time_t - REAR_AXLE_ROAD_LAG)
+        road_vel_front = road_velocity_func(time_t)
+        road_vel_rear = road_velocity_func(time_t - REAR_AXLE_ROAD_LAG)
+        
+        chassis_front_displacement = vertical_bounce - self.distance_front_axle * pitch_angle
+        chassis_rear_displacement = vertical_bounce + self.distance_rear_axle * pitch_angle
+        chassis_front_velocity = vertical_velocity - self.distance_front_axle * pitch_velocity
+        chassis_rear_velocity = vertical_velocity + self.distance_rear_axle * pitch_velocity
+        
+        front_compression = front_wheel_displacement - chassis_front_displacement
+        rear_compression = rear_wheel_displacement - chassis_rear_displacement
+        
+        front_comp_velocity = front_wheel_velocity - chassis_front_velocity
+        rear_comp_velocity = rear_wheel_velocity - chassis_rear_velocity
+        
+        front_suspension_force = front_spring_rate * front_compression + front_damping * front_comp_velocity
+        rear_suspension_force = rear_spring_rate * rear_compression + rear_damping * rear_comp_velocity
+        
+        front_tire_compression = road_height_front - front_wheel_displacement
+        rear_tire_compression = road_height_rear - rear_wheel_displacement
+        
+        front_tire_comp_velocity = road_vel_front - front_wheel_velocity
+        rear_tire_comp_velocity = road_vel_rear - rear_wheel_velocity
+        
+        front_tire_force = max(0.0, TIRE_STIFFNESS * front_tire_compression + TIRE_DAMPING * front_tire_comp_velocity)
+        rear_tire_force = max(0.0, TIRE_STIFFNESS * rear_tire_compression + TIRE_DAMPING * rear_tire_comp_velocity)
+        
+        vertical_chassis_acceleration = (front_suspension_force + rear_suspension_force) / self.chassis_sprung_mass - GRAVITY
+        pitch_chassis_acceleration = (rear_suspension_force * self.distance_rear_axle - front_suspension_force * self.distance_front_axle) / self.pitch_inertia 
+        
+        front_wheel_acceleration = (front_tire_force - front_suspension_force) / self.front_unsprung_mass - GRAVITY
+        rear_wheel_acceleration = (rear_tire_force - rear_suspension_force) / self.rear_unsprung_mass - GRAVITY
+        
+        return [
+            vertical_velocity, vertical_chassis_acceleration, 
+            pitch_velocity, pitch_chassis_acceleration, 
+            front_wheel_velocity, front_wheel_acceleration, 
+            rear_wheel_velocity, rear_wheel_acceleration
+        ]
+
+    def compute_realism_penalties(self, front_spring_rate, front_damping, rear_spring_rate, rear_damping, weights):
+        """Penalty terms that keep the optimizer from picking physically
+        unrealistic setups that would otherwise score well on ride-response
+        alone: springs too soft (underspring_penalty) or a damping ratio far
+        from the profile's target band (damping_ratio_penalty). Added into
+        simulate_bump()'s cost_score, weighted by `weights`."""
+        # Each profile carries its own target/floor now (see PROFILE_WEIGHTS),
+        # rather than every profile sharing one hardcoded comfort-tuned value.
+        spring_rate_min = weights.get("spring_rate_min", 25000.0)
+        damping_ratio_target = weights.get("damping_ratio_target", 0.45)
+        damping_ratio_tolerance = weights.get("damping_ratio_tolerance", 0.20)
+
+        # Underspring penalty: normalized as a fractional shortfall relative
+        # to the floor, so it's O(1) at "zero stiffness" and O(0) at or above
+        # the floor, regardless of what the floor's absolute value is.
+        front_shortfall_frac = max(0.0, spring_rate_min - front_spring_rate) / spring_rate_min
+        rear_shortfall_frac = max(0.0, spring_rate_min - rear_spring_rate) / spring_rate_min
+        underspring_penalty = front_shortfall_frac ** 2 + rear_shortfall_frac ** 2
+
+        # Damping-ratio penalty: normalized in units of "tolerance widths"
+        # past the allowed band around the target, so weight values mean
+        # the same thing across profiles even though targets/tolerances differ.
+        front_damping_ratio, rear_damping_ratio = self.compute_damping_ratios(
+            front_spring_rate, front_damping, rear_spring_rate, rear_damping
+        )
+        damping_ratio_penalty = 0.0
+        for damping_ratio in (front_damping_ratio, rear_damping_ratio):
+            excess_deviation = abs(damping_ratio - damping_ratio_target) - damping_ratio_tolerance
+            if excess_deviation > 0.0:
+                # Cap "tolerance widths past the band" before squaring - see
+                # DAMPING_RATIO_PENALTY_MAX_WIDTHS above. Without this, an
+                # overdamped setup (damping large relative to a soft spring's
+                # small critical damping) has no upper bound on how far past
+                # the band it can sit, and this term alone could reach the
+                # hundreds - dwarfing every actual ride-response measurement
+                # in the cost and making the score reflect "how close to my
+                # assumed target damping ratio" rather than "how the car
+                # actually rides".
+                widths_past_band = min(
+                    excess_deviation / damping_ratio_tolerance, DAMPING_RATIO_PENALTY_MAX_WIDTHS
+                )
+                damping_ratio_penalty += widths_past_band ** 2
+
+        return (
+            weights.get("underspring_penalty", 0.0) * underspring_penalty
+            + weights.get("damping_ratio_penalty", 0.0) * damping_ratio_penalty
+        )
+
+    def compute_damping_ratios(self, front_spring_rate, front_damping, rear_spring_rate, rear_damping):
+        """Convert raw spring/damping rates into dimensionless damping ratios
+        (actual damping / critical damping) for front and rear, used by
+        compute_realism_penalties() to check against each profile's target
+        damping-ratio band."""
+        front_sprung_load = self.chassis_sprung_mass * self.distance_rear_axle / WHEELBASE
+        rear_sprung_load = self.chassis_sprung_mass * self.distance_front_axle / WHEELBASE
+        front_critical_damping = 2.0 * np.sqrt(front_spring_rate * front_sprung_load)
+        rear_critical_damping = 2.0 * np.sqrt(rear_spring_rate * rear_sprung_load)
+        front_damping_ratio = front_damping / front_critical_damping
+        rear_damping_ratio = rear_damping / rear_critical_damping
+        return front_damping_ratio, rear_damping_ratio
+
+
+# --- Scoring & plotting helpers used by the Streamlit UI (section 3) to
+# explain/display simulate_bump()'s results - not called by the simulator
+# or optimizer themselves. ---
 def resolve_profile_weights(profile):
     """Same lookup simulate_bump() uses internally, exposed for display purposes
     (e.g. the score-explanation popover) so the two never drift apart."""
@@ -889,6 +954,10 @@ def render_score_explanation(weights, profile_name):
 
 
 def plot_optimization_history(history):
+    """Render the 3-panel live progress chart (score per trial, best-so-far,
+    and parameter values over trials) shown while the Bayesian Optimization
+    loop is running. `history` is the dict the optimization loop appends to
+    after every simulator evaluation."""
     iterations = history["iteration"]
     fig, axes = plt.subplots(1, 3, figsize=(12, 3.5))
 
@@ -927,6 +996,15 @@ def plot_optimization_history(history):
 # TRACK_CONE_AI_INTEGRATION.md §8 "Verification plan"), so this whole block
 # can be exercised in a standalone script the same way HANDOFF.md describes
 # doing for the suspension cost function, before ever touching the live game.
+#
+# TrackPoint/TrackDefinition come first, before any function that uses them -
+# they're simple data classes referenced as type hints everywhere below, so
+# (like a struct) they need to exist before the functions that mention them
+# are even defined. After that, functions are ordered top-down by entry
+# point first (load_track_file, generate_all_cone_positions, build_ai_script,
+# compute_finish_line, select_finish_checkpoints - the ones the Streamlit UI
+# and the BeamNG track bridge actually call directly) followed by the
+# lower-level geometry helpers each of those relies on.
 
 @dataclass
 class TrackPoint:
@@ -946,45 +1024,6 @@ class TrackDefinition:
     closed_loop: bool = False
     default_width_m: float = DEFAULT_TRACK_WIDTH_M
     default_speed_mps: float = DEFAULT_TRACK_SPEED_MPS
-
-
-def _dedupe_near_points(points, min_spacing_m):
-    """Drop consecutive points closer together than min_spacing_m. See
-    TRACK_CONE_AI_INTEGRATION.md §1 - near-duplicate points produce a
-    near-zero-duration script segment that execute_script cannot satisfy
-    physically (it starts skipping points to catch up)."""
-    if not points:
-        return points
-    cleaned = [points[0]]
-    for p in points[1:]:
-        prev = cleaned[-1]
-        dist = math.hypot(p.x - prev.x, p.y - prev.y)
-        if dist >= min_spacing_m:
-            cleaned.append(p)
-    return cleaned
-
-
-def parse_track_csv(file_like):
-    """Parse a CSV track file (see TRACK_CONE_AI_INTEGRATION.md §1 for the
-    schema). Returns a plain list of raw dict rows - load_track_file() below
-    is what turns this into a validated TrackDefinition."""
-    text = file_like.read()
-    if isinstance(text, bytes):
-        text = text.decode("utf-8")
-    reader = csv.DictReader(io.StringIO(text))
-    rows = []
-    for row in reader:
-        rows.append({k: v for k, v in row.items() if v not in (None, "")})
-    return rows
-
-
-def parse_track_json(file_like):
-    """Parse a JSON track file (see TRACK_CONE_AI_INTEGRATION.md §1 for the
-    schema). Returns the parsed dict as-is - load_track_file() normalizes it."""
-    text = file_like.read()
-    if isinstance(text, bytes):
-        text = text.decode("utf-8")
-    return json.loads(text)
 
 
 def load_track_file(uploaded_file, filename_hint=None, origin_xy=TRACK_WORLD_ORIGIN_XY):
@@ -1055,172 +1094,6 @@ def load_track_file(uploaded_file, filename_hint=None, origin_xy=TRACK_WORLD_ORI
     )
 
 
-def _cumulative_arc_length(points, closed_loop):
-    """Returns a list of cumulative distances (same length as the point
-    list, or +1 if closed_loop, for the synthetic closing segment) and the
-    total track length."""
-    pts = list(points) + ([points[0]] if closed_loop else [])
-    cumulative = [0.0]
-    for prev, cur in zip(pts, pts[1:]):
-        cumulative.append(cumulative[-1] + math.hypot(cur.x - prev.x, cur.y - prev.y))
-    return pts, cumulative
-
-
-def _interpolate_track_point(pts, cumulative, target_dist, default_speed):
-    """Linearly interpolate x/y/z/speed_mps at a given arc-length distance
-    along the pts/cumulative pair produced by _cumulative_arc_length()."""
-    total = cumulative[-1]
-    target_dist = max(0.0, min(target_dist, total))
-    # Find the segment containing target_dist.
-    lo = 0
-    hi = len(cumulative) - 1
-    while lo < hi - 1:
-        mid = (lo + hi) // 2
-        if cumulative[mid] <= target_dist:
-            lo = mid
-        else:
-            hi = mid
-    seg_len = cumulative[hi] - cumulative[lo]
-    t = 0.0 if seg_len < 1e-9 else (target_dist - cumulative[lo]) / seg_len
-    a, b = pts[lo], pts[hi]
-    x = a.x + t * (b.x - a.x)
-    y = a.y + t * (b.y - a.y)
-    az = a.z if a.z is not None else 0.0
-    bz = b.z if b.z is not None else az
-    z = az + t * (bz - az)
-    aspeed = a.speed_mps if a.speed_mps is not None else default_speed
-    bspeed = b.speed_mps if b.speed_mps is not None else aspeed
-    speed = aspeed + t * (bspeed - aspeed)
-    return TrackPoint(x=x, y=y, z=z, speed_mps=speed)
-
-
-def resample_track_by_arc_length(track: TrackDefinition, spacing_m):
-    """Arc-length resample of the centerline at a fixed spacing, independent
-    of input point density (see TRACK_CONE_AI_INTEGRATION.md §2 step 4 /
-    §4). Always keeps the very first point exactly (and the closing point
-    for a closed loop) so the resampled path starts where the input did."""
-    pts, cumulative = _cumulative_arc_length(track.points, track.closed_loop)
-    total = cumulative[-1]
-    if total <= 0:
-        return list(track.points)
-    n_steps = max(1, int(total // spacing_m))
-    resampled = [
-        _interpolate_track_point(pts, cumulative, i * (total / n_steps), track.default_speed_mps)
-        for i in range(n_steps)
-    ]
-    if not track.closed_loop:
-        resampled.append(
-            _interpolate_track_point(pts, cumulative, total, track.default_speed_mps)
-        )
-    return resampled
-
-
-def compute_boundary_offsets(track: TrackDefinition):
-    """For each centerline point, compute left/right boundary points offset
-    by width_m / 2 along the local normal (see TRACK_CONE_AI_INTEGRATION.md
-    §2 steps 1-3). Central difference for interior points, forward/backward
-    difference at the open ends unless closed_loop."""
-    pts = track.points
-    n = len(pts)
-    left_pts, right_pts = [], []
-    for i in range(n):
-        if track.closed_loop:
-            prev_p, next_p = pts[(i - 1) % n], pts[(i + 1) % n]
-        else:
-            prev_p = pts[i - 1] if i > 0 else pts[i]
-            next_p = pts[i + 1] if i < n - 1 else pts[i]
-        tx, ty = next_p.x - prev_p.x, next_p.y - prev_p.y
-        tlen = math.hypot(tx, ty)
-        if tlen < 1e-9:
-            nx, ny = 0.0, 1.0
-        else:
-            nx, ny = -ty / tlen, tx / tlen  # left-hand normal
-        width = pts[i].width_m if pts[i].width_m is not None else track.default_width_m
-        half = width / 2.0
-        z = pts[i].z if pts[i].z is not None else 0.0
-        left_pts.append(TrackPoint(x=pts[i].x + nx * half, y=pts[i].y + ny * half, z=z))
-        right_pts.append(TrackPoint(x=pts[i].x - nx * half, y=pts[i].y - ny * half, z=z))
-    return left_pts, right_pts
-
-
-def generate_cone_positions(track: TrackDefinition, cone_spacing_m=DEFAULT_CONE_SPACING_M):
-    """Full pipeline from TRACK_CONE_AI_INTEGRATION.md §2: derive left/right
-    boundaries from the centerline, then arc-length resample each boundary
-    independently at cone_spacing_m. Returns a flat list of dicts:
-    {"x", "y", "z", "side"} with side in {"left", "right"}."""
-    left_pts, right_pts = compute_boundary_offsets(track)
-    left_track = TrackDefinition(
-        name=track.name + "_left", points=left_pts, closed_loop=track.closed_loop,
-        default_width_m=0.0, default_speed_mps=track.default_speed_mps,
-    )
-    right_track = TrackDefinition(
-        name=track.name + "_right", points=right_pts, closed_loop=track.closed_loop,
-        default_width_m=0.0, default_speed_mps=track.default_speed_mps,
-    )
-    cones = []
-    for side, side_track in (("left", left_track), ("right", right_track)):
-        for p in resample_track_by_arc_length(side_track, cone_spacing_m):
-            cones.append({"x": p.x, "y": p.y, "z": p.z or 0.0, "side": side})
-    return cones
-
-
-def compute_run_up_geometry(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M):
-    """Shared geometry for the run-up lane - the straight stretch the car
-    drives from its spawn point (see compute_run_up_start()) up to the
-    track's own first point. Used by both generate_run_up_cone_positions()
-    (to lay cones along this lane) and generate_all_cone_positions() (to
-    filter out any main-track cone that would fall inside it). Kept as a
-    separate function so both stay in agreement about where the lane
-    actually is instead of recomputing the tangent/width independently."""
-    p0, p1 = track.points[0], track.points[1]
-    dx, dy = p1.x - p0.x, p1.y - p0.y
-    dist = math.hypot(dx, dy) or 1.0
-    ux, uy = dx / dist, dy / dist
-    z0 = p0.z if p0.z is not None else 0.0
-    run_up_start = (p0.x - ux * run_up_m, p0.y - uy * run_up_m, z0)
-    width = p0.width_m if p0.width_m is not None else track.default_width_m
-    return {
-        "run_up_start": run_up_start,
-        "track_start": (p0.x, p0.y, z0),
-        "tangent": (ux, uy),
-        "width_m": width,
-    }
-
-
-def generate_run_up_cone_positions(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M,
-                                    cone_spacing_m=DEFAULT_CONE_SPACING_M):
-    """Cones flanking the run-up lane itself. generate_cone_positions() only
-    ever walks the track's own points, so the run-up stretch the car
-    actually spawns on and drives through before reaching node 0 had no
-    cones of its own - this fills that gap, using the same left/right
-    normal-offset convention as compute_boundary_offsets() (so a run-up
-    cone and the first track-boundary cone line up on the same left/right
-    lines rather than kinking sideways at the handoff point) and the same
-    width as the track's own first point (so the lane doesn't visually
-    pinch or flare right where the run-up meets the track).
-
-    Stops short of the track's first point itself (that pair of cones is
-    already produced by generate_cone_positions()) so the two cone sets
-    don't overlap/duplicate right at the handoff.
-    """
-    geom = compute_run_up_geometry(track, run_up_m=run_up_m)
-    ux, uy = geom["tangent"]
-    nx, ny = -uy, ux  # left-hand normal, matching compute_boundary_offsets()
-    half = geom["width_m"] / 2.0
-    run_up_start = geom["run_up_start"]
-    n_steps = max(1, int(run_up_m // cone_spacing_m))
-    step = run_up_m / n_steps
-    cones = []
-    for i in range(n_steps):
-        t = i * step
-        cx = run_up_start[0] + ux * t
-        cy = run_up_start[1] + uy * t
-        cz = run_up_start[2] or 0.0
-        cones.append({"x": cx + nx * half, "y": cy + ny * half, "z": cz, "side": "left"})
-        cones.append({"x": cx - nx * half, "y": cy - ny * half, "z": cz, "side": "right"})
-    return cones
-
-
 def generate_all_cone_positions(track: TrackDefinition, cone_spacing_m=DEFAULT_CONE_SPACING_M,
                                  run_up_m=RUN_UP_DISTANCE_M):
     """The actual cone layout used for spawning/preview: the normal
@@ -1265,96 +1138,6 @@ def generate_all_cone_positions(track: TrackDefinition, cone_spacing_m=DEFAULT_C
     return filtered_track_cones + run_up_cones
 
 
-def heading_to_spawn_quat(dx, dy):
-    """Convert a direction vector into a spawn rot_quat using the same
-    forward/backward convention BEAMNG_SPAWN_ROT_QUAT above needed an
-    empirical correction for. See TRACK_HEADING_ROT_OFFSET_DEG - flip it
-    to 0.0 if this turns out backward in-game."""
-    heading_deg = math.degrees(math.atan2(dy, dx))
-    return angle_to_quat((0, 0, heading_deg + TRACK_HEADING_ROT_OFFSET_DEG))
-
-
-def compute_run_up_start(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M):
-    """Returns (run_up_pos, rot_quat) - a point run_up_m behind the track's
-    first point along its initial tangent, and the rot_quat facing along
-    that same tangent. Used so the car spawns with room to roll up to
-    speed and align onto the path, instead of starting from a dead stop
-    exactly on top of the first AI-script node facing an unrelated
-    direction."""
-    p0, p1 = track.points[0], track.points[1]
-    dx, dy = p1.x - p0.x, p1.y - p0.y
-    dist = math.hypot(dx, dy) or 1.0
-    ux, uy = dx / dist, dy / dist
-    run_up_pos = (p0.x - ux * run_up_m, p0.y - uy * run_up_m, p0.z)
-    return run_up_pos, heading_to_spawn_quat(ux, uy)
-
-
-def _unit_tangent(a: "TrackPoint", b: "TrackPoint"):
-    """Unit vector from point a to point b in the x/y plane."""
-    dx, dy = b.x - a.x, b.y - a.y
-    dist = math.hypot(dx, dy) or 1.0
-    return dx / dist, dy / dist
-
-
-def compute_finish_line(track: TrackDefinition):
-    """Defines the start/finish line(s) used to auto-stop a track run (see
-    run_beamng_track_test() below) - this is what was missing before: the
-    old stopping condition was just a centerline distance-along-track
-    threshold, which only worked for open tracks and reads confusingly once
-    the car has overcorrected/wandered (exactly what was being seen).
-
-    The start line sits at the track's first point, perpendicular to the
-    initial tangent - the same tangent compute_run_up_start() spawns the
-    car along, so the car is guaranteed to cross it once early on just by
-    driving off the run-up.
-
-    Closed loops reuse that same line as the finish line: one full lap is
-    "cross it once to actually start, cross it a second time to finish."
-    Open tracks get a separate finish line at the *last* point, using the
-    tangent of the final segment, so completion doesn't depend on the
-    noisier distance-along-track heuristic at all.
-
-    Returns a dict: start_point/start_tangent, finish_point/finish_tangent
-    ((x, y) tuples / (ux, uy) unit tangents), and same_line (True for
-    closed loops, meaning the finish line above is literally the start
-    line reused).
-    """
-    p0, p1 = track.points[0], track.points[1]
-    start_point = (p0.x, p0.y)
-    start_tangent = _unit_tangent(p0, p1)
-    if track.closed_loop:
-        finish_point, finish_tangent, same_line = start_point, start_tangent, True
-    else:
-        p_last, p_prev = track.points[-1], track.points[-2]
-        finish_point = (p_last.x, p_last.y)
-        finish_tangent = _unit_tangent(p_prev, p_last)
-        same_line = False
-    return {
-        "start_point": start_point, "start_tangent": start_tangent,
-        "finish_point": finish_point, "finish_tangent": finish_tangent,
-        "same_line": same_line,
-    }
-
-
-def _signed_line_progress(pos_xy, line_point, line_tangent):
-    """Signed distance of pos_xy along line_tangent, measured from
-    line_point - negative "behind" the line, >=0 "at or past" it. A sign
-    flip between two consecutive samples (negative -> >=0) means the
-    infinite line perpendicular to line_tangent through line_point was
-    crossed moving forward. See _lateral_offset_from_line() for bounding
-    this to a finite gate."""
-    return (pos_xy[0] - line_point[0]) * line_tangent[0] + (pos_xy[1] - line_point[1]) * line_tangent[1]
-
-
-def _lateral_offset_from_line(pos_xy, line_point, line_tangent):
-    """Perpendicular distance of pos_xy from line_point, measured along the
-    normal of line_tangent. Used to bound a crossing to the finite gate
-    around the start/finish point (FINISH_LINE_HALF_WIDTH_M) rather than
-    the infinite line _signed_line_progress() checks the sign of."""
-    nx, ny = -line_tangent[1], line_tangent[0]
-    return (pos_xy[0] - line_point[0]) * nx + (pos_xy[1] - line_point[1]) * ny
-
-
 def build_ai_script(track: TrackDefinition, resample_spacing_m=TRACK_AI_SCRIPT_RESAMPLE_SPACING_M,
                      min_dt=MIN_SCRIPT_DT, run_up_m=0.0):
     """Build the timestamped waypoint list for vehicle.ai.execute_script()
@@ -1397,27 +1180,346 @@ def build_ai_script(track: TrackDefinition, resample_spacing_m=TRACK_AI_SCRIPT_R
     return script
 
 
-def _segment_indices_near(cumulative, total, closed_loop, prev_along, window_m):
-    """Returns the indices i of segments (pts[i] -> pts[i+1]) whose
-    arc-length span is within window_m of prev_along - the along-track
-    distance from the *previous* poll, not physical (x, y) distance. This
-    is what lets closest_point_on_polyline() distinguish two segments that
-    happen to sit at/near the same physical location (a self-intersecting
-    track, e.g. a figure-8) but are far apart in arc length: only the one
-    near where the car actually was last is considered.
+def compute_finish_line(track: TrackDefinition):
+    """Defines the start/finish line(s) used to auto-stop a track run (see
+    run_beamng_track_test() below) - this is what was missing before: the
+    old stopping condition was just a centerline distance-along-track
+    threshold, which only worked for open tracks and reads confusingly once
+    the car has overcorrected/wandered (exactly what was being seen).
 
-    For closed loops, distance wraps around the seam (total <-> 0), e.g.
-    prev_along near `total` should still consider segments near 0."""
-    n_segs = len(cumulative) - 1
+    The start line sits at the track's first point, perpendicular to the
+    initial tangent - the same tangent compute_run_up_start() spawns the
+    car along, so the car is guaranteed to cross it once early on just by
+    driving off the run-up.
 
-    def _arc_dist(d):
-        raw = abs(d - prev_along)
-        return min(raw, total - raw) if closed_loop else raw
+    Closed loops reuse that same line as the finish line: one full lap is
+    "cross it once to actually start, cross it a second time to finish."
+    Open tracks get a separate finish line at the *last* point, using the
+    tangent of the final segment, so completion doesn't depend on the
+    noisier distance-along-track heuristic at all.
 
-    return [
-        i for i in range(n_segs)
-        if min(_arc_dist(cumulative[i]), _arc_dist(cumulative[i + 1])) <= window_m
+    Returns a dict: start_point/start_tangent, finish_point/finish_tangent
+    ((x, y) tuples / (ux, uy) unit tangents), and same_line (True for
+    closed loops, meaning the finish line above is literally the start
+    line reused).
+    """
+    p0, p1 = track.points[0], track.points[1]
+    start_point = (p0.x, p0.y)
+    start_tangent = _unit_tangent(p0, p1)
+    if track.closed_loop:
+        finish_point, finish_tangent, same_line = start_point, start_tangent, True
+    else:
+        p_last, p_prev = track.points[-1], track.points[-2]
+        finish_point = (p_last.x, p_last.y)
+        finish_tangent = _unit_tangent(p_prev, p_last)
+        same_line = False
+    return {
+        "start_point": start_point, "start_tangent": start_tangent,
+        "finish_point": finish_point, "finish_tangent": finish_tangent,
+        "same_line": same_line,
+    }
+
+
+def select_finish_checkpoints(track: TrackDefinition, cone_positions, count=FINISH_CHECKPOINT_COUNT,
+                               rng=None):
+    """Pick `count` checkpoints spread evenly around the track's arc length,
+    each one an actual cone drawn from cone_positions (i.e. "randomly
+    selected evenly spaced cones from the file") rather than a synthetic
+    point - see FINISH_CHECKPOINT_COUNT above for why this exists: a
+    closed-loop track's finish gate is the same physical line as its start
+    gate, and the car can cross it more than once near the very start of a
+    run (run-up alignment wobble) without having driven any of the actual
+    lap. Requiring these to all be passed first before a gate crossing
+    counts as the finish rules that out, since they're spread around the
+    rest of the track and can't be reached that way.
+
+    Splits [0, total_track_length) into `count` equal arc-length bins and
+    picks one cone at random from whichever cones happen to fall in each
+    bin (falling back to the single closest cone to that bin's center if
+    none do) - "randomly selected" so the checkpoint isn't always the same
+    cone (or always on the same left/right side) on repeated runs of the
+    same track, while "evenly spaced" keeps them spread around the whole
+    lap instead of clustering wherever cone density happens to be higher.
+
+    Returns a list of {"x", "y", "along_m"} dicts. Empty if there are no
+    cones to pick from or the track has zero length."""
+    if not cone_positions or count <= 0:
+        return []
+    total_length = _cumulative_arc_length(track.points, track.closed_loop)[1][-1]
+    if total_length <= 0:
+        return []
+    rng = rng if rng is not None else random
+
+    # Tag each cone with its arc-length position along the centerline so
+    # cones (which live on the left/right boundary offsets, not the
+    # centerline itself - see generate_cone_positions()) can be grouped
+    # into arc-length bins.
+    tagged = [
+        (closest_point_on_polyline(cone["x"], cone["y"], track)[0], cone)
+        for cone in cone_positions
     ]
+
+    bin_width = total_length / count
+    checkpoints = []
+    for i in range(count):
+        bin_lo, bin_hi = i * bin_width, (i + 1) * bin_width
+        candidates = [cone for along, cone in tagged if bin_lo <= along < bin_hi]
+        if not candidates:
+            # No cone happened to land in this bin (possible with sparse
+            # cone spacing relative to `count`) - fall back to whichever
+            # cone is arc-length-closest to the bin's center so every bin
+            # still contributes one checkpoint.
+            bin_center = (bin_lo + bin_hi) / 2.0
+            _, nearest_cone = min(tagged, key=lambda t: abs(t[0] - bin_center))
+            candidates = [nearest_cone]
+        chosen = rng.choice(candidates)
+        along, _, _ = closest_point_on_polyline(chosen["x"], chosen["y"], track)
+        checkpoints.append({"x": chosen["x"], "y": chosen["y"], "along_m": along})
+    return checkpoints
+
+
+def _dedupe_near_points(points, min_spacing_m):
+    """Drop consecutive points closer together than min_spacing_m. See
+    TRACK_CONE_AI_INTEGRATION.md §1 - near-duplicate points produce a
+    near-zero-duration script segment that execute_script cannot satisfy
+    physically (it starts skipping points to catch up)."""
+    if not points:
+        return points
+    cleaned = [points[0]]
+    for p in points[1:]:
+        prev = cleaned[-1]
+        dist = math.hypot(p.x - prev.x, p.y - prev.y)
+        if dist >= min_spacing_m:
+            cleaned.append(p)
+    return cleaned
+
+
+def parse_track_csv(file_like):
+    """Parse a CSV track file (see TRACK_CONE_AI_INTEGRATION.md §1 for the
+    schema). Returns a plain list of raw dict rows - load_track_file() below
+    is what turns this into a validated TrackDefinition."""
+    text = file_like.read()
+    if isinstance(text, bytes):
+        text = text.decode("utf-8")
+    reader = csv.DictReader(io.StringIO(text))
+    rows = []
+    for row in reader:
+        rows.append({k: v for k, v in row.items() if v not in (None, "")})
+    return rows
+
+
+def parse_track_json(file_like):
+    """Parse a JSON track file (see TRACK_CONE_AI_INTEGRATION.md §1 for the
+    schema). Returns the parsed dict as-is - load_track_file() normalizes it."""
+    text = file_like.read()
+    if isinstance(text, bytes):
+        text = text.decode("utf-8")
+    return json.loads(text)
+
+
+def generate_cone_positions(track: TrackDefinition, cone_spacing_m=DEFAULT_CONE_SPACING_M):
+    """Full pipeline from TRACK_CONE_AI_INTEGRATION.md §2: derive left/right
+    boundaries from the centerline, then arc-length resample each boundary
+    independently at cone_spacing_m. Returns a flat list of dicts:
+    {"x", "y", "z", "side"} with side in {"left", "right"}."""
+    left_pts, right_pts = compute_boundary_offsets(track)
+    left_track = TrackDefinition(
+        name=track.name + "_left", points=left_pts, closed_loop=track.closed_loop,
+        default_width_m=0.0, default_speed_mps=track.default_speed_mps,
+    )
+    right_track = TrackDefinition(
+        name=track.name + "_right", points=right_pts, closed_loop=track.closed_loop,
+        default_width_m=0.0, default_speed_mps=track.default_speed_mps,
+    )
+    cones = []
+    for side, side_track in (("left", left_track), ("right", right_track)):
+        for p in resample_track_by_arc_length(side_track, cone_spacing_m):
+            cones.append({"x": p.x, "y": p.y, "z": p.z or 0.0, "side": side})
+    return cones
+
+
+def resample_track_by_arc_length(track: TrackDefinition, spacing_m):
+    """Arc-length resample of the centerline at a fixed spacing, independent
+    of input point density (see TRACK_CONE_AI_INTEGRATION.md §2 step 4 /
+    §4). Always keeps the very first point exactly (and the closing point
+    for a closed loop) so the resampled path starts where the input did."""
+    pts, cumulative = _cumulative_arc_length(track.points, track.closed_loop)
+    total = cumulative[-1]
+    if total <= 0:
+        return list(track.points)
+    n_steps = max(1, int(total // spacing_m))
+    resampled = [
+        _interpolate_track_point(pts, cumulative, i * (total / n_steps), track.default_speed_mps)
+        for i in range(n_steps)
+    ]
+    if not track.closed_loop:
+        resampled.append(
+            _interpolate_track_point(pts, cumulative, total, track.default_speed_mps)
+        )
+    return resampled
+
+
+def _interpolate_track_point(pts, cumulative, target_dist, default_speed):
+    """Linearly interpolate x/y/z/speed_mps at a given arc-length distance
+    along the pts/cumulative pair produced by _cumulative_arc_length()."""
+    total = cumulative[-1]
+    target_dist = max(0.0, min(target_dist, total))
+    # Find the segment containing target_dist.
+    lo = 0
+    hi = len(cumulative) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if cumulative[mid] <= target_dist:
+            lo = mid
+        else:
+            hi = mid
+    seg_len = cumulative[hi] - cumulative[lo]
+    t = 0.0 if seg_len < 1e-9 else (target_dist - cumulative[lo]) / seg_len
+    a, b = pts[lo], pts[hi]
+    x = a.x + t * (b.x - a.x)
+    y = a.y + t * (b.y - a.y)
+    az = a.z if a.z is not None else 0.0
+    bz = b.z if b.z is not None else az
+    z = az + t * (bz - az)
+    aspeed = a.speed_mps if a.speed_mps is not None else default_speed
+    bspeed = b.speed_mps if b.speed_mps is not None else aspeed
+    speed = aspeed + t * (bspeed - aspeed)
+    return TrackPoint(x=x, y=y, z=z, speed_mps=speed)
+
+
+def compute_boundary_offsets(track: TrackDefinition):
+    """For each centerline point, compute left/right boundary points offset
+    by width_m / 2 along the local normal (see TRACK_CONE_AI_INTEGRATION.md
+    §2 steps 1-3). Central difference for interior points, forward/backward
+    difference at the open ends unless closed_loop."""
+    pts = track.points
+    n = len(pts)
+    left_pts, right_pts = [], []
+    for i in range(n):
+        if track.closed_loop:
+            prev_p, next_p = pts[(i - 1) % n], pts[(i + 1) % n]
+        else:
+            prev_p = pts[i - 1] if i > 0 else pts[i]
+            next_p = pts[i + 1] if i < n - 1 else pts[i]
+        tx, ty = next_p.x - prev_p.x, next_p.y - prev_p.y
+        tlen = math.hypot(tx, ty)
+        if tlen < 1e-9:
+            nx, ny = 0.0, 1.0
+        else:
+            nx, ny = -ty / tlen, tx / tlen  # left-hand normal
+        width = pts[i].width_m if pts[i].width_m is not None else track.default_width_m
+        half = width / 2.0
+        z = pts[i].z if pts[i].z is not None else 0.0
+        left_pts.append(TrackPoint(x=pts[i].x + nx * half, y=pts[i].y + ny * half, z=z))
+        right_pts.append(TrackPoint(x=pts[i].x - nx * half, y=pts[i].y - ny * half, z=z))
+    return left_pts, right_pts
+
+
+def generate_run_up_cone_positions(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M,
+                                    cone_spacing_m=DEFAULT_CONE_SPACING_M):
+    """Cones flanking the run-up lane itself. generate_cone_positions() only
+    ever walks the track's own points, so the run-up stretch the car
+    actually spawns on and drives through before reaching node 0 had no
+    cones of its own - this fills that gap, using the same left/right
+    normal-offset convention as compute_boundary_offsets() (so a run-up
+    cone and the first track-boundary cone line up on the same left/right
+    lines rather than kinking sideways at the handoff point) and the same
+    width as the track's own first point (so the lane doesn't visually
+    pinch or flare right where the run-up meets the track).
+
+    Stops short of the track's first point itself (that pair of cones is
+    already produced by generate_cone_positions()) so the two cone sets
+    don't overlap/duplicate right at the handoff.
+    """
+    geom = compute_run_up_geometry(track, run_up_m=run_up_m)
+    ux, uy = geom["tangent"]
+    nx, ny = -uy, ux  # left-hand normal, matching compute_boundary_offsets()
+    half = geom["width_m"] / 2.0
+    run_up_start = geom["run_up_start"]
+    n_steps = max(1, int(run_up_m // cone_spacing_m))
+    step = run_up_m / n_steps
+    cones = []
+    for i in range(n_steps):
+        t = i * step
+        cx = run_up_start[0] + ux * t
+        cy = run_up_start[1] + uy * t
+        cz = run_up_start[2] or 0.0
+        cones.append({"x": cx + nx * half, "y": cy + ny * half, "z": cz, "side": "left"})
+        cones.append({"x": cx - nx * half, "y": cy - ny * half, "z": cz, "side": "right"})
+    return cones
+
+
+def compute_run_up_geometry(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M):
+    """Shared geometry for the run-up lane - the straight stretch the car
+    drives from its spawn point (see compute_run_up_start()) up to the
+    track's own first point. Used by both generate_run_up_cone_positions()
+    (to lay cones along this lane) and generate_all_cone_positions() (to
+    filter out any main-track cone that would fall inside it). Kept as a
+    separate function so both stay in agreement about where the lane
+    actually is instead of recomputing the tangent/width independently."""
+    p0, p1 = track.points[0], track.points[1]
+    dx, dy = p1.x - p0.x, p1.y - p0.y
+    dist = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / dist, dy / dist
+    z0 = p0.z if p0.z is not None else 0.0
+    run_up_start = (p0.x - ux * run_up_m, p0.y - uy * run_up_m, z0)
+    width = p0.width_m if p0.width_m is not None else track.default_width_m
+    return {
+        "run_up_start": run_up_start,
+        "track_start": (p0.x, p0.y, z0),
+        "tangent": (ux, uy),
+        "width_m": width,
+    }
+
+
+def compute_run_up_start(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M):
+    """Returns (run_up_pos, rot_quat) - a point run_up_m behind the track's
+    first point along its initial tangent, and the rot_quat facing along
+    that same tangent. Used so the car spawns with room to roll up to
+    speed and align onto the path, instead of starting from a dead stop
+    exactly on top of the first AI-script node facing an unrelated
+    direction."""
+    p0, p1 = track.points[0], track.points[1]
+    dx, dy = p1.x - p0.x, p1.y - p0.y
+    dist = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / dist, dy / dist
+    run_up_pos = (p0.x - ux * run_up_m, p0.y - uy * run_up_m, p0.z)
+    return run_up_pos, heading_to_spawn_quat(ux, uy)
+
+
+def heading_to_spawn_quat(dx, dy):
+    """Convert a direction vector into a spawn rot_quat using the same
+    forward/backward convention BEAMNG_SPAWN_ROT_QUAT above needed an
+    empirical correction for. See TRACK_HEADING_ROT_OFFSET_DEG - flip it
+    to 0.0 if this turns out backward in-game."""
+    heading_deg = math.degrees(math.atan2(dy, dx))
+    return angle_to_quat((0, 0, heading_deg + TRACK_HEADING_ROT_OFFSET_DEG))
+
+
+def _unit_tangent(a: "TrackPoint", b: "TrackPoint"):
+    """Unit vector from point a to point b in the x/y plane."""
+    dx, dy = b.x - a.x, b.y - a.y
+    dist = math.hypot(dx, dy) or 1.0
+    return dx / dist, dy / dist
+
+
+def _signed_line_progress(pos_xy, line_point, line_tangent):
+    """Signed distance of pos_xy along line_tangent, measured from
+    line_point - negative "behind" the line, >=0 "at or past" it. A sign
+    flip between two consecutive samples (negative -> >=0) means the
+    infinite line perpendicular to line_tangent through line_point was
+    crossed moving forward. See _lateral_offset_from_line() for bounding
+    this to a finite gate."""
+    return (pos_xy[0] - line_point[0]) * line_tangent[0] + (pos_xy[1] - line_point[1]) * line_tangent[1]
+
+
+def _lateral_offset_from_line(pos_xy, line_point, line_tangent):
+    """Perpendicular distance of pos_xy from line_point, measured along the
+    normal of line_tangent. Used to bound a crossing to the finite gate
+    around the start/finish point (FINISH_LINE_HALF_WIDTH_M) rather than
+    the infinite line _signed_line_progress() checks the sign of."""
+    nx, ny = -line_tangent[1], line_tangent[0]
+    return (pos_xy[0] - line_point[0]) * nx + (pos_xy[1] - line_point[1]) * ny
 
 
 def closest_point_on_polyline(px, py, track: TrackDefinition, prev_along=None,
@@ -1492,67 +1594,50 @@ def closest_point_on_polyline(px, py, track: TrackDefinition, prev_along=None,
     return best_along, best_lateral, total
 
 
-def select_finish_checkpoints(track: TrackDefinition, cone_positions, count=FINISH_CHECKPOINT_COUNT,
-                               rng=None):
-    """Pick `count` checkpoints spread evenly around the track's arc length,
-    each one an actual cone drawn from cone_positions (i.e. "randomly
-    selected evenly spaced cones from the file") rather than a synthetic
-    point - see FINISH_CHECKPOINT_COUNT above for why this exists: a
-    closed-loop track's finish gate is the same physical line as its start
-    gate, and the car can cross it more than once near the very start of a
-    run (run-up alignment wobble) without having driven any of the actual
-    lap. Requiring these to all be passed first before a gate crossing
-    counts as the finish rules that out, since they're spread around the
-    rest of the track and can't be reached that way.
+def _cumulative_arc_length(points, closed_loop):
+    """Returns a list of cumulative distances (same length as the point
+    list, or +1 if closed_loop, for the synthetic closing segment) and the
+    total track length."""
+    pts = list(points) + ([points[0]] if closed_loop else [])
+    cumulative = [0.0]
+    for prev, cur in zip(pts, pts[1:]):
+        cumulative.append(cumulative[-1] + math.hypot(cur.x - prev.x, cur.y - prev.y))
+    return pts, cumulative
 
-    Splits [0, total_track_length) into `count` equal arc-length bins and
-    picks one cone at random from whichever cones happen to fall in each
-    bin (falling back to the single closest cone to that bin's center if
-    none do) - "randomly selected" so the checkpoint isn't always the same
-    cone (or always on the same left/right side) on repeated runs of the
-    same track, while "evenly spaced" keeps them spread around the whole
-    lap instead of clustering wherever cone density happens to be higher.
 
-    Returns a list of {"x", "y", "along_m"} dicts. Empty if there are no
-    cones to pick from or the track has zero length."""
-    if not cone_positions or count <= 0:
-        return []
-    total_length = _cumulative_arc_length(track.points, track.closed_loop)[1][-1]
-    if total_length <= 0:
-        return []
-    rng = rng if rng is not None else random
+def _segment_indices_near(cumulative, total, closed_loop, prev_along, window_m):
+    """Returns the indices i of segments (pts[i] -> pts[i+1]) whose
+    arc-length span is within window_m of prev_along - the along-track
+    distance from the *previous* poll, not physical (x, y) distance. This
+    is what lets closest_point_on_polyline() distinguish two segments that
+    happen to sit at/near the same physical location (a self-intersecting
+    track, e.g. a figure-8) but are far apart in arc length: only the one
+    near where the car actually was last is considered.
 
-    # Tag each cone with its arc-length position along the centerline so
-    # cones (which live on the left/right boundary offsets, not the
-    # centerline itself - see generate_cone_positions()) can be grouped
-    # into arc-length bins.
-    tagged = [
-        (closest_point_on_polyline(cone["x"], cone["y"], track)[0], cone)
-        for cone in cone_positions
+    For closed loops, distance wraps around the seam (total <-> 0), e.g.
+    prev_along near `total` should still consider segments near 0."""
+    n_segs = len(cumulative) - 1
+
+    def _arc_dist(d):
+        raw = abs(d - prev_along)
+        return min(raw, total - raw) if closed_loop else raw
+
+    return [
+        i for i in range(n_segs)
+        if min(_arc_dist(cumulative[i]), _arc_dist(cumulative[i + 1])) <= window_m
     ]
-
-    bin_width = total_length / count
-    checkpoints = []
-    for i in range(count):
-        bin_lo, bin_hi = i * bin_width, (i + 1) * bin_width
-        candidates = [cone for along, cone in tagged if bin_lo <= along < bin_hi]
-        if not candidates:
-            # No cone happened to land in this bin (possible with sparse
-            # cone spacing relative to `count`) - fall back to whichever
-            # cone is arc-length-closest to the bin's center so every bin
-            # still contributes one checkpoint.
-            bin_center = (bin_lo + bin_hi) / 2.0
-            _, nearest_cone = min(tagged, key=lambda t: abs(t[0] - bin_center))
-            candidates = [nearest_cone]
-        chosen = rng.choice(candidates)
-        along, _, _ = closest_point_on_polyline(chosen["x"], chosen["y"], track)
-        checkpoints.append({"x": chosen["x"], "y": chosen["y"], "along_m": along})
-    return checkpoints
 
 
 # ==========================================
 # 2. BEAMNG AUTOMATION BRIDGE
 # ==========================================
+# Entry points first (load_beamng_scenario, run_beamng_test - what the
+# Streamlit UI calls directly), then the camera/native-start helpers used
+# internally by run_beamng_test's "Run AI Lap"-style flow, ordered so
+# _run_native_start_and_test (the one that kicks the others off) appears
+# above wait_for_native_start, which appears above resume_and_focus_camera,
+# which appears above set_camera_mode - each one only below the thing that
+# calls it.
 def load_beamng_scenario(bng_home=None):
     """Launch BeamNG, build/load the scenario, and spawn the test vehicle -
     but stop short of driving or starting the timer. This is the "scenario
@@ -1988,39 +2073,41 @@ def run_beamng_test(beamng_client, test_vehicle):
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
-def resume_and_focus_camera(beamng_client, test_vehicle):
-    """Resume the sim (if paused) and switch the player camera onto
-    test_vehicle, returning a human-readable warning string on any failure
-    or None on success. Shared by every flow that needs the camera to
-    actually follow the car - previously each flow duplicated this logic
-    with its own bare `except Exception: pass`, which is why camera/resume
-    failures kept going unnoticed. Any caller should st.warning() a non-None
-    return value rather than swallow it again."""
-    warning = None
-    try:
-        beamng_client.resume()
-    except Exception as resume_exc:
-        return f"beamng_client.resume() failed: {resume_exc}"
+def _run_native_start_and_test(client, vehicle):
+    """Shared helper: wait for the player to press the accelerator inside
+    BeamNG, then run the timed test if they did. Used by both the initial
+    "Load Scenario" click and the "Resume Waiting" fallback so disconnect/
+    timeout handling only has to live in one place."""
+    outcome = wait_for_native_start(client, vehicle)
 
-    try:
-        beamng_client.vehicles.switch(test_vehicle)
-        available_camera_modes = beamng_client.camera.get_player_modes(test_vehicle)
-        preferred_modes = ["onboard", "driver", "hood", "chase", "orbit"]
-        chosen_mode = next(
-            (m for m in preferred_modes if m in available_camera_modes),
-            None,
-        )
-        if chosen_mode:
-            beamng_client.camera.set_player_mode(test_vehicle, chosen_mode, config={})
-        else:
-            warning = (
-                f"No preferred camera mode found in available modes: "
-                f"{available_camera_modes!r}"
-            )
-    except Exception as cam_exc:
-        warning = f"Camera mode switch failed: {cam_exc}"
+    if outcome == "disconnected":
+        st.session_state.last_bng_result = {
+            "error": (
+                "Lost connection to BeamNG while waiting for you to start the "
+                "test - it looks like the game was closed or crashed before "
+                "the accelerator was pressed."
+            ),
+            "connection_lost": True,
+        }
+        st.session_state.active_bng_client = None
+        st.session_state.active_bng_vehicle = None
+        st.session_state.bng_scenario_loaded = False
+        return
 
-    return warning
+    if outcome == "timeout":
+        # Scenario stays loaded and ready - nothing to do here.
+        return
+
+    # outcome == "started"
+    with st.spinner("Running timed AI test drive..."):
+        validation_result = run_beamng_test(client, vehicle)
+    st.session_state.last_bng_result = validation_result
+    st.session_state.bng_scenario_loaded = False
+    if validation_result.get("connection_lost"):
+        # The client is dead - don't leave it in session state as if the
+        # game were still sitting open and pausable.
+        st.session_state.active_bng_client = None
+        st.session_state.active_bng_vehicle = None
 
 
 def wait_for_native_start(beamng_client, test_vehicle, poll_interval=0.05,
@@ -2106,41 +2193,47 @@ def wait_for_native_start(beamng_client, test_vehicle, poll_interval=0.05,
         status_placeholder.empty()
 
 
-def _run_native_start_and_test(client, vehicle):
-    """Shared helper: wait for the player to press the accelerator inside
-    BeamNG, then run the timed test if they did. Used by both the initial
-    "Load Scenario" click and the "Resume Waiting" fallback so disconnect/
-    timeout handling only has to live in one place."""
-    outcome = wait_for_native_start(client, vehicle)
+def resume_and_focus_camera(beamng_client, test_vehicle,
+                             preferred_modes=("onboard", "driver", "hood", "chase", "orbit")):
+    """Resume the sim (if paused) and switch the player camera onto
+    test_vehicle, returning a human-readable warning string on any failure
+    or None on success. Shared by every flow that needs the camera to
+    actually follow the car once it's actually driving - previously each
+    flow duplicated this logic with its own bare `except Exception: pass`,
+    which is why camera/resume failures kept going unnoticed. Any caller
+    should st.warning() a non-None return value rather than swallow it
+    again."""
+    try:
+        beamng_client.resume()
+    except Exception as resume_exc:
+        return f"beamng_client.resume() failed: {resume_exc}"
+    return set_camera_mode(beamng_client, test_vehicle, preferred_modes)
 
-    if outcome == "disconnected":
-        st.session_state.last_bng_result = {
-            "error": (
-                "Lost connection to BeamNG while waiting for you to start the "
-                "test - it looks like the game was closed or crashed before "
-                "the accelerator was pressed."
-            ),
-            "connection_lost": True,
-        }
-        st.session_state.active_bng_client = None
-        st.session_state.active_bng_vehicle = None
-        st.session_state.bng_scenario_loaded = False
-        return
 
-    if outcome == "timeout":
-        # Scenario stays loaded and ready - nothing to do here.
-        return
+def set_camera_mode(beamng_client, test_vehicle, preferred_modes):
+    """Switches to test_vehicle and puts the player camera into the first
+    available mode from preferred_modes (checked in order), returning a
+    human-readable warning string on any failure or None on success.
 
-    # outcome == "started"
-    with st.spinner("Running timed AI test drive..."):
-        validation_result = run_beamng_test(client, vehicle)
-    st.session_state.last_bng_result = validation_result
-    st.session_state.bng_scenario_loaded = False
-    if validation_result.get("connection_lost"):
-        # The client is dead - don't leave it in session state as if the
-        # game were still sitting open and pausable.
-        st.session_state.active_bng_client = None
-        st.session_state.active_bng_vehicle = None
+    Pulled out of resume_and_focus_camera() so a caller that wants the
+    camera to land on the vehicle right away - e.g. immediately after it
+    spawns, while the sim is still deliberately paused for setup (cones,
+    sensors, etc.) - doesn't also have to resume the sim just to move the
+    camera. resume_and_focus_camera() below is now a thin wrapper around
+    this for callers that DO want both."""
+    try:
+        beamng_client.vehicles.switch(test_vehicle)
+        available_camera_modes = beamng_client.camera.get_player_modes(test_vehicle)
+        chosen_mode = next(
+            (m for m in preferred_modes if m in available_camera_modes),
+            None,
+        )
+        if chosen_mode:
+            beamng_client.camera.set_player_mode(test_vehicle, chosen_mode, config={})
+            return None
+        return f"No preferred camera mode found in available modes: {available_camera_modes!r}"
+    except Exception as cam_exc:
+        return f"Camera mode switch failed: {cam_exc}"
 
 
 # ==========================================
@@ -2152,18 +2245,32 @@ def _run_native_start_and_test(client, vehicle):
 # throttle/steering. See TRACK_CONE_AI_INTEGRATION.md for the full design
 # writeup - this is a direct implementation of that spec, and the two files
 # should be read together.
+# load_beamng_track_scenario() (build/load the scenario) comes before
+# run_beamng_track_test() (drive it and collect telemetry) - the two don't
+# call each other, so this is simply the order the Streamlit UI calls them
+# in: load the scenario first, then run the test.
 
 def load_beamng_track_scenario(bng_home, track: TrackDefinition, cone_spacing_m=DEFAULT_CONE_SPACING_M):
     """Launch BeamNG, load an empty scenario, spawn the test vehicle at the
-    track's first point, and attempt to place cones along the track
-    boundary. Mirrors load_beamng_scenario()'s structure closely on purpose.
+    track's first point, then live-spawn a cone at every position in
+    generate_all_cone_positions()'s output (see that function for how the
+    track-boundary and run-up-lane cone sets are combined/filtered).
+    Mirrors load_beamng_scenario()'s structure closely on purpose.
+
+    Cones are spawned as live Vehicle instances (model=BEAMNG_CONE_VEHICLE_MODEL,
+    part_config=BEAMNG_CONE_PROP_MODEL) after the ego vehicle is confirmed in
+    place, not baked into the scenario prefab - see the comments in this
+    function's body for why the prefab route doesn't work on this build.
 
     Returns a dict with "client", "vehicle", "cone_positions", and
     "cones_requested"/"cones_confirmed" counts on success, or "error" on
     failure. Cone placement is best-effort past the point the vehicle is
-    spawned and drivable - a cone-placement failure is reported as a
-    warning key ("cone_warning") rather than aborting the whole scenario,
-    since a track with missing cones is still useful to drive and inspect.
+    spawned and drivable - individual cone spawn failures don't abort the
+    scenario, only show up as a lower "cones_confirmed" count and a
+    "cone_warning" key, since a track with some cones missing is still
+    useful to drive and inspect. Likewise, a camera-focus failure shows up
+    as a "camera_warning" key rather than aborting the scenario - the run
+    is still perfectly usable from a free/default camera.
     """
     if not BEAMNG_AVAILABLE:
         return {"error": "beamngpy library not installed or configured."}
@@ -2209,30 +2316,24 @@ def load_beamng_track_scenario(bng_home, track: TrackDefinition, cone_spacing_m=
         scenario_name = f'ai_track_run_{unique_suffix}'
         scenario = Scenario(BEAMNG_MAP, scenario_name)
 
-        # Best-effort: place cones as StaticObjects baked into the prefab.
-        # Per TRACK_CONE_AI_INTEGRATION.md §3a/§3b, this project has already
-        # seen prefab-embedded objects (the vehicle) fail to actually appear
-        # in-world on this build - if that happens here too, cones_confirmed
-        # will read 0 below and the run should be treated as "no cones",
-        # not silently trusted.
-        cone_warning = None
-        try:
-            from beamngpy.scenario import StaticObject
-            for i, cone in enumerate(cone_positions):
-                scenario.add_object(StaticObject(
-                    name=f"track_cone_{i}",
-                    pos=(cone["x"], cone["y"], cone["z"]),
-                    rot_quat=(0, 0, 0, 1),
-                    scale=(1, 1, 1),
-                    shape=BEAMNG_CONE_PROP_MODEL,
-                ))
-        except Exception as cone_exc:
-            cone_warning = (
-                f"Could not add cone StaticObjects to the scenario "
-                f"(error: {cone_exc}). Proceeding without cones - see "
-                "TRACK_CONE_AI_INTEGRATION.md §3 for the live-spawn fallback."
-            )
-
+        # Cones are NOT added to the scenario/prefab here (no
+        # scenario.add_object(StaticObject(...)) - that was the previous
+        # version of this function, and it never actually worked, for two
+        # independent reasons:
+        #   1. Prefab-embedded objects are already known broken on this
+        #      BeamNG build - see the "prefab-embedded vehicles" comment on
+        #      the ego vehicle in load_beamng_scenario() above. Baking
+        #      cones into the same prefab hits that identical failure mode,
+        #      so they never appeared regardless of what shape/model they
+        #      pointed at.
+        #   2. BEAMNG_CONE_PROP_MODEL ("vehicles/cones/...") is a vehicle
+        #      model + part-config path (confirmed in-game by the user),
+        #      not a static-mesh shape path - StaticObject's "shape" field
+        #      expects the latter, so even a working prefab-embedding story
+        #      wouldn't have resolved it correctly.
+        # Cones are instead spawned live, further down, the exact same way
+        # as the ego vehicle (vehicles.spawn() at runtime) - see the cone
+        # spawn loop below, after the ego vehicle is confirmed in place.
         test_vehicle = Vehicle('ego_vehicle', model='etk800', license=BEAMNG_VEHICLE_LICENSE)
         scenario.make(beamng_client)
 
@@ -2329,23 +2430,81 @@ def load_beamng_track_scenario(bng_home, track: TrackDefinition, cone_spacing_m=
         except Exception:
             pass
 
-        # Best-effort confirmation count - the exact "objects in world"
-        # query varies by beamngpy version (see TRACK_CONE_AI_INTEGRATION.md
-        # §3), so this tries a couple of plausible method names and falls
-        # back to "unknown" rather than crashing the whole scenario load
-        # over a diagnostics call.
-        cones_confirmed = None
-        for method_name in ("find_static_objects", "find_objects_class"):
-            finder = getattr(scenario, method_name, None)
-            if finder:
-                try:
-                    cones_confirmed = len(finder("cone") if method_name == "find_objects_class" else finder())
-                    break
-                except Exception:
-                    continue
+        # Cones, live-spawned - see the comment above (near scenario_name)
+        # for why this replaced the old prefab-embedded StaticObject
+        # approach. Each cone is its own Vehicle instance
+        # (model=BEAMNG_CONE_VEHICLE_MODEL, part_config=BEAMNG_CONE_PROP_MODEL,
+        # the exact model/part-config pair the user confirmed in-game),
+        # spawned with connect=False since a decorative cone needs no
+        # sensors or control - only to physically exist in the world -
+        # and opening a full sensor connection for every one of what can
+        # be 100+ cones would be pure overhead.
+        #
+        # The "let the game snap each cone to the ground" flag is passed
+        # under whichever name THIS installed beamngpy version actually
+        # accepts, checked once via inspect.signature() rather than
+        # hardcoded - beamngpy 1.36 renamed VehiclesApi.spawn()'s old
+        # cling: bool to safe_spawn: bool (keeping cling as a deprecated
+        # alias), but not every installed version necessarily has the new
+        # name yet (confirmed in-game: passing safe_spawn on such a build
+        # raises "unexpected keyword argument 'safe_spawn'" immediately -
+        # every single cone failed with that same error, not a real
+        # spawn/physics problem). Falls back to no ground-snap kwarg at
+        # all on a version with neither name, rather than failing every
+        # cone spawn the same way over one parameter name.
+        cone_spawn_kwargs = {}
+        try:
+            _spawn_params = inspect.signature(beamng_client.vehicles.spawn).parameters
+            if "safe_spawn" in _spawn_params:
+                cone_spawn_kwargs["safe_spawn"] = True
+            elif "cling" in _spawn_params:
+                cone_spawn_kwargs["cling"] = True
+        except (TypeError, ValueError):
+            pass
+
+        cone_warning = None
+        cones_confirmed = 0
+        cone_spawn_errors = []
+        for i, cone in enumerate(cone_positions):
+            try:
+                cone_vehicle = Vehicle(
+                    f"track_cone_{i}", model=BEAMNG_CONE_VEHICLE_MODEL,
+                    part_config=BEAMNG_CONE_PROP_MODEL,
+                )
+                cone_spawned = beamng_client.vehicles.spawn(
+                    cone_vehicle, pos=(cone["x"], cone["y"], cone["z"]),
+                    rot_quat=(0, 0, 0, 1), connect=False, **cone_spawn_kwargs,
+                )
+                if cone_spawned:
+                    cones_confirmed += 1
+                else:
+                    cone_spawn_errors.append(f"cone {i}: vehicles.spawn() reported failure")
+            except Exception as cone_exc:
+                cone_spawn_errors.append(f"cone {i}: {cone_exc}")
+        if cones_confirmed < len(cone_positions):
+            example = f" (e.g. {cone_spawn_errors[0]})" if cone_spawn_errors else ""
+            cone_warning = (
+                f"Only {cones_confirmed}/{len(cone_positions)} cones spawned "
+                f"successfully{example}. Proceeding with the run - see the "
+                "driven-path plot to check which stretches of track ended up "
+                "unmarked."
+            )
 
         test_vehicle.ai.set_mode('disabled')
         test_vehicle.control(throttle=0.0, steering=0.0, brake=1.0)
+
+        # Snap the camera onto the vehicle in orbit mode right here, as
+        # soon as the vehicle (and cones) are actually in the world -
+        # not deferred until "Run AI Lap" is pressed. This was previously
+        # only ever done in resume_and_focus_camera(), which also resumes
+        # the sim - that's still correct for "Run AI Lap" (the sim
+        # actually needs to be running for the lap), but it meant the
+        # camera stayed on whatever BeamNG's own default was for the
+        # entire time between loading the scenario and starting a run.
+        # set_camera_mode() (unlike resume_and_focus_camera()) doesn't
+        # touch the sim's pause state, so this can happen immediately
+        # without prematurely resuming physics before the user is ready.
+        camera_warning = set_camera_mode(beamng_client, test_vehicle, ["orbit"])
 
         st.session_state.track_bng_client = beamng_client
         st.session_state.track_bng_vehicle = test_vehicle
@@ -2360,6 +2519,8 @@ def load_beamng_track_scenario(bng_home, track: TrackDefinition, cone_spacing_m=
         }
         if cone_warning:
             result["cone_warning"] = cone_warning
+        if camera_warning:
+            result["camera_warning"] = camera_warning
         return result
 
     except Exception as e:
@@ -3315,12 +3476,18 @@ with st.expander("🏁 Track / Cone AI Driving (Beta)", expanded=False):
             else:
                 st.success(
                     f"Scenario loaded. Requested {scenario_result.get('cones_requested', 0)} cones; "
-                    f"confirmed {scenario_result.get('cones_confirmed', 'unknown')} in-world "
-                    "(confirmation method varies by beamngpy version - 'unknown' doesn't mean "
-                    "cones are missing, just that this build couldn't be queried)."
+                    f"{scenario_result.get('cones_confirmed', 0)} spawned successfully "
+                    "(this is an exact count of successful vehicles.spawn() calls for the "
+                    "cones, not a guess)."
                 )
                 if scenario_result.get("cone_warning"):
                     st.warning(scenario_result["cone_warning"])
+                if scenario_result.get("camera_warning"):
+                    st.warning(
+                        f"⚠️ Camera may still be in free-cam: {scenario_result['camera_warning']} "
+                        "You can switch views manually in-game (default key is "
+                        "usually F7/Numpad keys depending on your BeamNG bindings)."
+                    )
 
         run_result = st.session_state.last_track_run_result
         if run_result is not None:
