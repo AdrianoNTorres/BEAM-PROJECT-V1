@@ -219,7 +219,7 @@ CUSTOM_DAMPING_RANGE_ABSOLUTE_LIMITS = (0, 100000)     # Ns/m
 
 # --- Vehicle Layout & Fundamental Physical Constants ---
 # BEAMNG ETK800 AS REFERENCE
-BEAMNG_AI_SPEED = 50.0         
+BEAMNG_AI_SPEED = 15.0         
 CHASSIS_SPRUNG_MASS = 1455.0   
 FRONT_UNSPRUNG_MASS = 40.0     
 REAR_UNSPRUNG_MASS = 40.0      
@@ -235,15 +235,20 @@ PITCH_INERTIA = CHASSIS_SPRUNG_MASS * (DISTANCE_FRONT_AXLE * DISTANCE_REAR_AXLE)
 
 # --- Simulation Profile Settings ---
 SIM_TIME_START = 0.0     
-SIM_TIME_END = 5.0       
+SIM_TIME_END = 20.0       
 SIM_TIME_POINTS = 150    
 
-BUMP_START_TIME = 1.0    
-BUMP_HEIGHT = 0.05       
-BUMP_LENGTH = 0.5        
+BUMP_START_TIME = 1.0
+BUMP_HEIGHT = 0.05
+SINGLE_BUMP_LENGTH = 5.0     # Length of one individual bump (e.g., meters)
+TOTAL_BUMPS = 5              # Number of sequential bumps
 
-BUMP_DURATION = BUMP_LENGTH / BEAMNG_AI_SPEED
-BUMP_END_TIME = BUMP_START_TIME + BUMP_DURATION 
+# Automatically derived track properties
+TOTAL_BUMP_DISTANCE = SINGLE_BUMP_LENGTH * TOTAL_BUMPS
+SINGLE_BUMP_DURATION = SINGLE_BUMP_LENGTH / BEAMNG_AI_SPEED
+TOTAL_BUMP_DURATION = SINGLE_BUMP_DURATION * TOTAL_BUMPS
+
+BUMP_END_TIME = BUMP_START_TIME + TOTAL_BUMP_DURATION
 
 BUMP_EVENT_END = BUMP_END_TIME + REAR_AXLE_ROAD_LAG + 0.15
 POST_BUMP_START = BUMP_END_TIME + REAR_AXLE_ROAD_LAG + 0.2
@@ -406,7 +411,7 @@ BEAMNG_PORT = 25252
 BEAMNG_MAP = 'gridmap_v2'
 BEAMNG_VEHICLE_MODEL = 'etkc'
 BEAMNG_VEHICLE_LICENSE = 'AI_TEST'
-BEAMNG_SPAWN_POS = (-2956.696, 1257.925, 100.132)
+BEAMNG_SPAWN_POS = (-3000, 1000, 100)
 # Rotation captured from the World Editor Inspector (rotationEuler Z = 180 deg,
 # X/Y = 0), originally converted straight to quaternion (x, y, z, w) as
 # (0, 0, 1, 0) - a pure 180 deg yaw about Z. In practice that made the car
@@ -458,12 +463,20 @@ TRACK_WORLD_ORIGIN_XY = (BEAMNG_SPAWN_POS[0], BEAMNG_SPAWN_POS[1])
 #      heading instead of the fixed constant.
 # The heading->quat conversion below WAS empirically verified in-game: at
 # the +180 deg offset it still drove backward at the start of every track
-# run (confirmed by the user), so this is now flipped to +0.0 deg (i.e.
+# run (confirmed by the user), so this was flipped to +0.0 deg (i.e.
 # heading_to_spawn_quat() just uses the initial tangent's heading
-# directly, with no correction). If a future BeamNG/track-heading change
-# ever makes it drive backward again, +180.0 is the other value to try -
-# see BEAMNG_SPAWN_ROT_QUAT's comment above for why a load-bearing heading
-# constant like this needs to be re-verified in-game rather than assumed.
+# directly, with no correction). That fixed the forward/backward (180 deg)
+# problem, but the user then reported a separate 90 deg error: at +0.0 the
+# car spawns rotated 90 deg counterclockwise from where it should be -
+# parallel to the start/finish gate instead of perpendicular to it (see
+# the RUN_UP_DISTANCE_M note just below for why perpendicular is correct).
+# Countering a 90-deg-CCW error means rotating the heading 90 deg
+# clockwise, i.e. subtracting 90 deg, so this is now -90.0. If that
+# overshoots and the car instead spawns rotated 90 deg clockwise (i.e. the
+# error flips sign instead of disappearing), the fix is the other
+# direction, +90.0 - see BEAMNG_SPAWN_ROT_QUAT's comment above for why a
+# load-bearing heading constant like this needs to be re-verified in-game
+# rather than assumed.
 #
 # RUN_UP_DISTANCE_M is the run-up gap ahead of the start/finish gate the
 # car is spawned at, facing straight along the track's initial tangent -
@@ -471,7 +484,7 @@ TRACK_WORLD_ORIGIN_XY = (BEAMNG_SPAWN_POS[0], BEAMNG_SPAWN_POS[1])
 # compute_run_up_start()), so the car meets the line squared-up rather
 # than at an angle. Set to 5.0 m per the user's requested spawn gap.
 RUN_UP_DISTANCE_M = 25.0
-TRACK_HEADING_ROT_OFFSET_DEG = 0.0
+TRACK_HEADING_ROT_OFFSET_DEG = 75.0
 
 # --- Start/finish line + run-timeout settings (see compute_finish_line()
 # and run_beamng_track_test() below) ---
@@ -522,8 +535,8 @@ TELEPORT_Z_CLEARANCE_M = 0.15
 # has to match ("cones", the folder this part config lives under).
 BEAMNG_CONE_PROP_MODEL = "vehicles/cones/small_orange_white_single.pc"
 BEAMNG_CONE_VEHICLE_MODEL = "cones"
-DEFAULT_TRACK_WIDTH_M = 8.0
-DEFAULT_TRACK_SPEED_MPS = 14.0
+DEFAULT_TRACK_WIDTH_M = 10.0
+DEFAULT_TRACK_SPEED_MPS = BEAMNG_AI_SPEED
 DEFAULT_CONE_SPACING_M = 5.0
 MIN_TRACK_POINT_SPACING_M = 0.5
 MIN_SCRIPT_DT = 0.05  # seconds; floor for execute_script's per-node timing,
@@ -631,13 +644,33 @@ class HalfCarPitchSimulator:
         # PROFILE_WEIGHTS) or a fully-formed weights dict (used for the
         # user-defined "Custom" objective built in the sidebar).
         def road_speed_bump(time_t):
-            if BUMP_START_TIME <= time_t <= BUMP_END_TIME:
-                return BUMP_HEIGHT * np.sin(np.pi * (time_t - BUMP_START_TIME) / (BUMP_END_TIME - BUMP_START_TIME))
+            total_duration = (BUMP_END_TIME - BUMP_START_TIME)
+            total_train_duration = total_duration * 10
+    
+            if BUMP_START_TIME <= time_t <= (BUMP_START_TIME + total_train_duration):
+                elapsed = time_t - BUMP_START_TIME
+                bump_index = int(elapsed // total_duration)
+                if bump_index >= 10:
+                    return 0.0
+            
+                # Use modulo to get the repeating local time inside the current bump
+                local_t = elapsed % total_duration
+                return BUMP_HEIGHT * np.sin(np.pi * local_t / total_duration)
             return 0.0
 
         def road_speed_bump_velocity(time_t):
-            if BUMP_START_TIME <= time_t <= BUMP_END_TIME:
-                return BUMP_HEIGHT * (np.pi / (BUMP_END_TIME - BUMP_START_TIME)) * np.cos(np.pi * (time_t - BUMP_START_TIME) / (BUMP_END_TIME - BUMP_START_TIME))
+            total_duration = (BUMP_END_TIME - BUMP_START_TIME)
+            total_train_duration = total_duration * 10
+    
+            if BUMP_START_TIME <= time_t <= (BUMP_START_TIME + total_train_duration):
+                elapsed = time_t - BUMP_START_TIME
+                bump_index = int(elapsed // total_duration)
+                if bump_index >= 10:
+                    return 0.0
+            
+                local_t = elapsed % total_duration
+                omega = np.pi / total_duration
+                return BUMP_HEIGHT * omega * np.cos(omega * local_t)
             return 0.0
 
         static_vertical_bounce, static_pitch_angle, static_front_wheel, static_rear_wheel = self.compute_static_equilibrium(
@@ -658,7 +691,7 @@ class HalfCarPitchSimulator:
                 time_t, state_vector, front_spring_rate, front_damping, rear_spring_rate, rear_damping, road_speed_bump, road_speed_bump_velocity
             ),
             time_span, initial_state, t_eval=time_evaluation_points,
-            max_step=BUMP_DURATION / 4.0
+            max_step=SINGLE_BUMP_DURATION / 4.0
         )
         
         chassis_heave_response = simulation_solution.y[0] - static_vertical_bounce
@@ -1490,8 +1523,10 @@ def compute_run_up_start(track: TrackDefinition, run_up_m=RUN_UP_DISTANCE_M):
 def heading_to_spawn_quat(dx, dy):
     """Convert a direction vector into a spawn rot_quat using the same
     forward/backward convention BEAMNG_SPAWN_ROT_QUAT above needed an
-    empirical correction for. See TRACK_HEADING_ROT_OFFSET_DEG - flip it
-    to 0.0 if this turns out backward in-game."""
+    empirical correction for. See TRACK_HEADING_ROT_OFFSET_DEG - currently
+    -90.0 to fix a reported 90-deg-counterclockwise spawn-heading error;
+    adjust that constant (not this function) if the error direction ever
+    changes."""
     heading_deg = math.degrees(math.atan2(dy, dx))
     return angle_to_quat((0, 0, heading_deg + TRACK_HEADING_ROT_OFFSET_DEG))
 
@@ -3103,7 +3138,7 @@ with column_left:
     ax.plot(time_axis, bounce_data, label="Chassis Heave", color="royalblue", linewidth=2)
     ax.set_xlabel("Time (seconds)")
     ax.set_ylabel("Height from Static Ride Height (m)")
-    ax.set_title(f"Simulated Response Over {int(BUMP_HEIGHT*100)}cm Speed Bump")
+    ax.set_title("Simulated Response Over 10 Sequential Washboard Bumps")
     ax.grid(True, linestyle="--", alpha=0.6)
     ax.legend()
     st.pyplot(fig)
