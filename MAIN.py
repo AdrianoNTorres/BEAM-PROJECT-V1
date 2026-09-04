@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import streamlit as st
 
 from scipy.integrate import solve_ivp   # numerical ODE integrator (Runge-Kutta family)
@@ -235,7 +236,7 @@ PITCH_INERTIA = CHASSIS_SPRUNG_MASS * (DISTANCE_FRONT_AXLE * DISTANCE_REAR_AXLE)
 
 # --- Simulation Profile Settings ---
 SIM_TIME_START = 0.0     
-SIM_TIME_END = 20.0       
+SIM_TIME_END = 5.0      
 SIM_TIME_POINTS = 150    
 
 BUMP_START_TIME = 1.0
@@ -634,7 +635,8 @@ class HalfCarPitchSimulator:
     def simulate_bump(self, front_spring_rate, front_damping, rear_spring_rate, rear_damping, profile="Comfort (Smooth Ride)"):
         """Main entry point: simulate the car driving over the road bump with
         the given spring/damper settings and return (cost_score, time points,
-        chassis heave response, front wheel height, rear wheel height).
+        chassis heave response, front wheel height, rear wheel height, front
+        road profile height, rear road profile height).
         cost_score is the scalar the Bayesian Optimization loop minimizes -
         lower is a smoother/more controlled ride under the given `profile`.
         Internally this finds the pre-bump static equilibrium, integrates the
@@ -644,32 +646,30 @@ class HalfCarPitchSimulator:
         # PROFILE_WEIGHTS) or a fully-formed weights dict (used for the
         # user-defined "Custom" objective built in the sidebar).
         def road_speed_bump(time_t):
-            total_duration = (BUMP_END_TIME - BUMP_START_TIME)
-            total_train_duration = total_duration * 10
-    
-            if BUMP_START_TIME <= time_t <= (BUMP_START_TIME + total_train_duration):
+            # Per-bump width is SINGLE_BUMP_DURATION (bump length / speed),
+            # and there are TOTAL_BUMPS of them - this must agree with
+            # BUMP_END_TIME/BUMP_EVENT_END/POST_BUMP_START above, which are
+            # derived from TOTAL_BUMP_DURATION = SINGLE_BUMP_DURATION * TOTAL_BUMPS.
+            if BUMP_START_TIME <= time_t <= (BUMP_START_TIME + TOTAL_BUMP_DURATION):
                 elapsed = time_t - BUMP_START_TIME
-                bump_index = int(elapsed // total_duration)
-                if bump_index >= 10:
+                bump_index = int(elapsed // SINGLE_BUMP_DURATION)
+                if bump_index >= TOTAL_BUMPS:
                     return 0.0
             
                 # Use modulo to get the repeating local time inside the current bump
-                local_t = elapsed % total_duration
-                return BUMP_HEIGHT * np.sin(np.pi * local_t / total_duration)
+                local_t = elapsed % SINGLE_BUMP_DURATION
+                return BUMP_HEIGHT * np.sin(np.pi * local_t / SINGLE_BUMP_DURATION)
             return 0.0
 
         def road_speed_bump_velocity(time_t):
-            total_duration = (BUMP_END_TIME - BUMP_START_TIME)
-            total_train_duration = total_duration * 10
-    
-            if BUMP_START_TIME <= time_t <= (BUMP_START_TIME + total_train_duration):
+            if BUMP_START_TIME <= time_t <= (BUMP_START_TIME + TOTAL_BUMP_DURATION):
                 elapsed = time_t - BUMP_START_TIME
-                bump_index = int(elapsed // total_duration)
-                if bump_index >= 10:
+                bump_index = int(elapsed // SINGLE_BUMP_DURATION)
+                if bump_index >= TOTAL_BUMPS:
                     return 0.0
             
-                local_t = elapsed % total_duration
-                omega = np.pi / total_duration
+                local_t = elapsed % SINGLE_BUMP_DURATION
+                omega = np.pi / SINGLE_BUMP_DURATION
                 return BUMP_HEIGHT * omega * np.cos(omega * local_t)
             return 0.0
 
@@ -789,7 +789,11 @@ class HalfCarPitchSimulator:
             )
         )
         
-        return cost_score, time_evaluation_points, chassis_heave_response, front_height_response, rear_height_response
+        return (
+            cost_score, time_evaluation_points, chassis_heave_response,
+            front_height_response, rear_height_response,
+            road_height_front_series, road_height_rear_series,
+        )
 
     def compute_static_equilibrium(self, front_spring_rate, rear_spring_rate):
         """Find the car's resting position (ride height + pitch) under its own
@@ -1020,6 +1024,85 @@ def plot_optimization_history(history):
 
     fig.tight_layout()
     return fig
+
+
+def render_interactive_timeseries(time_axis, series, title, y_title, key_prefix, y_range=(-1.0, 1.0)):
+    """Render an interactive Plotly line chart for one or more named series
+    sharing a time axis, plus CSV/JSON download buttons for the underlying
+    data. Used for both the road-profile plot and the simulated-response
+    plot so they behave identically (zoom, pan, hover tooltips, export).
+
+    `series` is a list of (label, values, color, dash_style) tuples.
+    `y_range` sets the chart's *initial* y-axis view (defaults to -1..+1);
+    it does not clamp the data or block the user from zooming/panning past
+    it - double-click the chart to reset back to this default view, or use
+    the mode bar's autoscale/zoom-out controls to see the full data range.
+    """
+    fig = go.Figure()
+    for label, values, color, dash in series:
+        fig.add_trace(go.Scatter(
+            x=time_axis, y=values, mode="lines", name=label,
+            line=dict(color=color, width=2, dash=dash),
+            hovertemplate=f"{label}<br>t=%{{x:.3f}} s<br>%{{y:.4f}}<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time (seconds)",
+        yaxis_title=y_title,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=380,
+    )
+    # Initial view only - not a hard clamp. Autorange stays enabled so the
+    # user can zoom out (mode bar "Autoscale") or drag/scroll-zoom freely;
+    # double-clicking the plot snaps back to this -1..+1 default range.
+    fig.update_yaxes(range=list(y_range), autorange=False)
+    fig.update_xaxes(autorange=True)
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        theme=None,
+        config={
+            "scrollZoom": True,
+            "displaylogo": False,
+            "modeBarButtonsToAdd": ["toggleSpikelines"],
+            "toImageButtonOptions": {"filename": key_prefix},
+        },
+        key=f"{key_prefix}_chart",
+    )
+
+    # --- Data export (CSV / JSON) -----------------------------------------
+    export_columns = {"time_s": np.asarray(time_axis, dtype=float)}
+    for label, values, _, _ in series:
+        column_key = label.lower().replace(" ", "_").replace("(", "").replace(")", "")
+        export_columns[column_key] = np.asarray(values, dtype=float)
+
+    csv_buffer = io.StringIO()
+    csv_writer = csv.writer(csv_buffer)
+    csv_writer.writerow(export_columns.keys())
+    csv_writer.writerows(zip(*export_columns.values()))
+
+    json_payload = json.dumps(
+        {key: values.tolist() for key, values in export_columns.items()},
+        indent=2,
+    )
+
+    export_col_csv, export_col_json = st.columns(2)
+    with export_col_csv:
+        st.download_button(
+            "⬇ Download CSV", data=csv_buffer.getvalue(),
+            file_name=f"{key_prefix}.csv", mime="text/csv",
+            key=f"{key_prefix}_csv_dl", use_container_width=True,
+        )
+    with export_col_json:
+        st.download_button(
+            "⬇ Download JSON", data=json_payload,
+            file_name=f"{key_prefix}.json", mime="application/json",
+            key=f"{key_prefix}_json_dl", use_container_width=True,
+        )
 
 
 # ==========================================
@@ -3112,7 +3195,10 @@ column_left, column_right = st.columns(2)
 with column_left:
     st.subheader("Python Physics Surrogate Model")
     
-    current_cost, time_axis, bounce_data, front_height_data, rear_height_data = simulator.simulate_bump(
+    (
+        current_cost, time_axis, bounce_data, front_height_data, rear_height_data,
+        front_road_data, rear_road_data,
+    ) = simulator.simulate_bump(
         front_spring_input, front_damping_input, rear_spring_input, rear_damping_input,
         profile=selected_profile
     )
@@ -3132,16 +3218,30 @@ with column_left:
             with st.expander("ℹ️"):
                 render_score_explanation(weights_for_display, selected_profile_name)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(time_axis, front_height_data, label="Front Wheel Height", color="crimson", linewidth=1.5, linestyle="-.")
-    ax.plot(time_axis, rear_height_data, label="Rear Wheel Height", color="darkorange", linewidth=1.5, linestyle="--")
-    ax.plot(time_axis, bounce_data, label="Chassis Heave", color="royalblue", linewidth=2)
-    ax.set_xlabel("Time (seconds)")
-    ax.set_ylabel("Height from Static Ride Height (m)")
-    ax.set_title("Simulated Response Over 10 Sequential Washboard Bumps")
-    ax.grid(True, linestyle="--", alpha=0.6)
-    ax.legend()
-    st.pyplot(fig)
+    st.markdown("##### Road Input Profile")
+    render_interactive_timeseries(
+        time_axis,
+        series=[
+            ("Front Road Height", front_road_data, "crimson", "dashdot"),
+            ("Rear Road Height", rear_road_data, "darkorange", "dash"),
+        ],
+        title="Road Profile Input (Front & Rear Axle)",
+        y_title="Road Height (m)",
+        key_prefix="road_profile",
+    )
+
+    st.markdown("##### Simulated Suspension Response")
+    render_interactive_timeseries(
+        time_axis,
+        series=[
+            ("Front Wheel Height", front_height_data, "crimson", "dashdot"),
+            ("Rear Wheel Height", rear_height_data, "darkorange", "dash"),
+            ("Chassis Heave", bounce_data, "royalblue", "solid"),
+        ],
+        title=f"Simulated Response Over {TOTAL_BUMPS} Sequential Washboard Bumps",
+        y_title="Height from Static Ride Height (m)",
+        key_prefix="chassis_response",
+    )
 
 with column_right:
     st.subheader("BeamNG Game Validation Engine")
